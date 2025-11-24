@@ -155,19 +155,19 @@ async def predict_sales(file: UploadFile = File(...)):
         min_mse = min(mse_ses, mse_des, mse_tes, mse_prophet)
 
         if min_mse == mse_ses:
-            best_model_name = "Single Exponential Smoothing (SES)"
+            best_model_name = "SES"
             best_fit_values = fit_ses.fittedvalues
             best_forecast_values = fit_ses.forecast(forecast_steps)
         elif min_mse == mse_des:
-            best_model_name = "Double Exponential Smoothing (DES)"
+            best_model_name = "DES"
             best_fit_values = fit_des.fittedvalues
             best_forecast_values = fit_des.forecast(forecast_steps)
         elif min_mse == mse_tes:
-            best_model_name = "Triple Exponential Smoothing (TES)"
+            best_model_name = "TES"
             best_fit_values = fit_tes.fittedvalues
             best_forecast_values = fit_tes.forecast(forecast_steps)
         elif min_mse == mse_prophet:
-            best_model_name = "Prophet"
+            best_model_name = "PP"
             best_fit_values = best_fit_values_prophet
             best_forecast_values = best_forecast_values_prophet
 
