@@ -5,3 +5,4 @@ numpy
 python-multipart
 openpyxl
 statsmodels
+prophet
