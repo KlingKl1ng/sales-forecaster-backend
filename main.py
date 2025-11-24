@@ -145,23 +145,23 @@ async def predict_sales(
         # If specific model selected, run ONLY that one
         if model_type == "ses":
             res = run_ses()
-            if res: models_run["Single Exponential Smoothing (SES)"] = res
+            if res: models_run["SES"] = res
             
         elif model_type == "des":
             res = run_des()
-            if res: models_run["Double Exponential Smoothing (DES)"] = res
+            if res: models_run["DES"] = res
             
         elif model_type == "tes":
             res = run_tes()
-            if res: models_run["Triple Exponential Smoothing (TES)"] = res
+            if res: models_run["TES"] = res
             
         elif model_type == "prophet":
             res = run_prophet()
-            if res: models_run["Prophet"] = res
+            if res: models_run["PRO"] = res
             
         elif model_type == "arima":
             res = run_arima()
-            if res: models_run["ARIMA"] = res
+            if res: models_run["ARI"] = res
             
         else: # "auto" or unknown -> Run ALL and compare
             res_ses = run_ses()
@@ -174,10 +174,10 @@ async def predict_sales(
             if res_tes: models_run["TES"] = res_tes
             
             res_pp = run_prophet()
-            if res_pp: models_run["Prophet"] = res_pp
+            if res_pp: models_run["PRO"] = res_pp
             
             res_arima = run_arima()
-            if res_arima: models_run["ARIMA"] = res_arima
+            if res_arima: models_run["ARI"] = res_arima
 
         # --- PICK WINNER ---
         if not models_run:
