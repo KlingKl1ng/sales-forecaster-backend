@@ -6,6 +6,7 @@ import io
 import os
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from prophet import Prophet
+from pmdarima import auto_arima
 
 app = FastAPI()
 
@@ -106,7 +107,7 @@ async def predict_sales(file: UploadFile = File(...)):
         except Exception as e:
             print(f"TES Failed: {e}")
 
-        # D. Prophet (New)
+        # D. Prophet
         mse_prophet = float('inf')
         prophet_predictions = None
         best_fit_values_prophet = None
@@ -146,13 +147,40 @@ async def predict_sales(file: UploadFile = File(...)):
         except Exception as e:
             print(f"Prophet Failed: {e}")
 
+        # E. ARIMA
+        mse_arima = float('inf')
+        fit_arima = None
+        best_fit_values_arima = None
+        best_forecast_values_arima = None
+        try:
+            # Use auto_arima to find the best ARIMA model
+            # seasonal=True is often important for sales data (e.g., monthly seasonality)
+            # m=12 for monthly data (yearly seasonality)
+            model_arima = auto_arima(training_series, seasonal=True, m=12, suppress_warnings=True, stepwise=True)
+            fit_arima = model_arima.fit(training_series)
+
+            # Get fitted values
+            best_fit_values_arima = pd.Series(fit_arima.fittedvalues(), index=training_series.index)
+            residuals_arima = training_series - best_fit_values_arima
+            mse_arima, _, _ = metrics(residuals_arima)
+
+            # Forecast future values
+            forecast_arima = fit_arima.predict(n_periods=forecast_steps)
+            # Generate future dates for the forecast
+            last_date = training_series.index[-1]
+            future_dates_arima = pd.date_range(start=last_date, periods=forecast_steps + 1, freq='MS')[1:]
+            best_forecast_values_arima = pd.Series(forecast_arima, index=future_dates_arima)
+
+        except Exception as e:
+            print(f"ARIMA Failed: {e}")
+
         # --- MODEL SELECTION ---
         best_model_name = ""
         best_fit_values = None
         best_forecast_values = None
 
-        # Include mse_prophet in the comparison
-        min_mse = min(mse_ses, mse_des, mse_tes, mse_prophet)
+        # Include mse_arima in the comparison
+        min_mse = min(mse_ses, mse_des, mse_tes, mse_prophet, mse_arima)
 
         if min_mse == mse_ses:
             best_model_name = "SES"
@@ -170,6 +198,10 @@ async def predict_sales(file: UploadFile = File(...)):
             best_model_name = "PP"
             best_fit_values = best_fit_values_prophet
             best_forecast_values = best_forecast_values_prophet
+        elif min_mse == mse_arima:
+            best_model_name = "ARIMA"
+            best_fit_values = best_fit_values_arima
+            best_forecast_values = best_forecast_values_arima
 
         print(f"Selected Model: {best_model_name}")
 
@@ -184,15 +216,9 @@ async def predict_sales(file: UploadFile = File(...)):
                     fitted_val = int(round(val))
             history_data.append({"name": date_idx.strftime('%b %Y'), "actual": int(round(actual_val)), "fitted": fitted_val})
 
-        # Bridge Gap: This logic might need refinement if fitted and forecast are strictly separate.
-        # For now, it copies the last fitted value to forecast if it's the bridge point.
         if len(history_data) > 0:
             last_point = history_data[-1]
-            # This assumes the last fitted point is the first point of the forecast bridge.
-            # For Prophet, fitted values are for historical data, forecast is strictly future.
-            # We don't need to 'bridge' by copying fitted to forecast as they are distinct.
-            # The `forecast` list will start where `history` ends.
-            pass # Removing the bridge gap logic as it's not universally applicable and can be confusing.
+            pass
 
         forecast_data = []
         if best_forecast_values is not None:
@@ -210,9 +236,7 @@ async def predict_sales(file: UploadFile = File(...)):
         }
 
     except HTTPException as he:
-        # Pass through our custom errors (like the 400 we raised above)
         raise he
     except Exception as e:
-        # Catch unexpected server crashes
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
