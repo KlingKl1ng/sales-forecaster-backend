@@ -1,23 +1,35 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
 import io
-import os
+import logging
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from prophet import Prophet
+# from pmdarima import auto_arima  <-- KEPT COMMENTED OUT
+import warnings
+
+# --- CONFIGURATION ---
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sales_forecaster")
 
 app = FastAPI()
 
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- METRICS FUNCTION ---
+# --- HEALTH CHECK ---
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "Sales Forecaster (Fixed Syntax)"}
+
 def metrics(residuals):
     residuals = residuals.dropna()
     if len(residuals) == 0:
@@ -28,191 +40,180 @@ def metrics(residuals):
     return mse, rmse, mae
 
 @app.post("/predict")
-async def predict_sales(file: UploadFile = File(...)):
+async def predict_sales(
+    file: UploadFile = File(...),
+    model_type: str = Form("auto") 
+):
     try:
-        # 1. READ CONTENT
+        logger.info(f"--- NEW REQUEST: {file.filename} [{model_type}] ---")
         contents = await file.read()
-
-        # --- SAFE LOAD START (The Fix) ---
-        # We read raw first to avoid crashing on missing index columns
+        
+        # --- SAFE LOAD ---
         try:
             df = pd.read_excel(io.BytesIO(contents))
-        except:
-             raise HTTPException(status_code=400, detail="The uploaded file does not satisfy the requirements above")
+        except Exception as e:
+            logger.error(f"File Load Error: {e}")
+            raise HTTPException(status_code=400, detail="Could not read Excel file.")
 
-        # Clean headers (remove accidental spaces)
         df.columns = df.columns.astype(str).str.strip()
-
-        # Check Required Columns BEFORE processing
         required_columns = ['Period', 'Sales_quantity']
         if not all(col in df.columns for col in required_columns):
-             # This ensures we send YOUR custom message, not a Server Error
-             raise HTTPException(status_code=400, detail="The uploaded file does not satisfy the requirements above")
+             raise HTTPException(status_code=400, detail=f"Missing columns. Required: {required_columns}")
 
-        # Now safe to parse dates
         try:
             df['Period'] = pd.to_datetime(df['Period'])
             df = df.set_index('Period')
             df = df.sort_index()
         except:
-             raise HTTPException(status_code=400, detail="The uploaded file does not satisfy the requirements above")
-        # --- SAFE LOAD END ---
-
-        # 2. CLEANING
+             raise HTTPException(status_code=400, detail="Period column must be dates.")
+        
         df = df.fillna(0)
-
-        # Force Frequency
         if df.index.freq is None:
             try:
                 df.index.freq = pd.infer_freq(df.index)
-            except:
-                pass
-
+            except: pass
         if df.index.freq is None:
              df = df.asfreq('MS')
              df = df.fillna(0)
 
-        # --- FORECASTING LOGIC ---
-        time_series = df['Sales_quantity']
-        training_series = time_series
+        training_series = df['Sales_quantity']
         forecast_steps = 6
+        models_run = {} 
 
-        # A. SES
-        model_ses = ExponentialSmoothing(training_series, trend=None, seasonal=None)
-        fit_ses = model_ses.fit(optimized=True)
-        residuals_ses = training_series - fit_ses.fittedvalues
-        mse_ses, _, _ = metrics(residuals_ses)
+        # --- MODEL FUNCTIONS ---
+        def run_ses():
+            try:
+                logger.info("Running SES...")
+                model = ExponentialSmoothing(training_series, trend=None, seasonal=None)
+                fit = model.fit(optimized=True)
+                mse, _, _ = metrics(training_series - fit.fittedvalues)
+                return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+            except Exception as e: 
+                logger.warning(f"SES Error: {e}")
+                return None
 
-        # B. DES
-        model_des = ExponentialSmoothing(training_series, trend="add", seasonal=None)
-        fit_des = model_des.fit(optimized=True)
-        residuals_des = training_series - fit_des.fittedvalues
-        mse_des, _, _ = metrics(residuals_des)
+        def run_des():
+            try:
+                logger.info("Running DES...")
+                model = ExponentialSmoothing(training_series, trend="add", seasonal=None)
+                fit = model.fit(optimized=True)
+                mse, _, _ = metrics(training_series - fit.fittedvalues)
+                return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+            except Exception as e: 
+                logger.warning(f"DES Error: {e}")
+                return None
 
-        # C. TES
-        mse_tes = float('inf')
-        fit_tes = None
-        try:
-            model_tes = ExponentialSmoothing(
-                training_series,
-                seasonal_periods=12,
-                trend='add',
-                seasonal='add',
-                freq='MS'
-            )
-            fit_tes = model_tes.fit(optimized=True)
-            residuals_tes = training_series - fit_tes.fittedvalues
-            mse_tes, _, _ = metrics(residuals_tes)
-        except Exception as e:
-            print(f"TES Failed: {e}")
+        def run_tes():
+            try:
+                logger.info("Running TES...")
+                model = ExponentialSmoothing(training_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS')
+                fit = model.fit(optimized=True)
+                mse, _, _ = metrics(training_series - fit.fittedvalues)
+                return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+            except Exception as e: 
+                logger.warning(f"TES Error: {e}")
+                return None
 
-        # D. Prophet (New)
-        mse_prophet = float('inf')
-        prophet_predictions = None
-        best_fit_values_prophet = None
-        best_forecast_values_prophet = None
-        try:
-            # Prepare data for Prophet
-            df_prophet = pd.DataFrame({'ds': training_series.index, 'y': training_series.values})
+        def run_prophet():
+            try:
+                logger.info("Running Prophet...")
+                df_prophet = pd.DataFrame({'ds': training_series.index, 'y': training_series.values})
+                m = Prophet(yearly_seasonality=True, daily_seasonality=False, weekly_seasonality=False)
+                m.fit(df_prophet)
+                future = m.make_future_dataframe(periods=forecast_steps, freq='MS')
+                forecast = m.predict(future)
+                
+                fitted_vals = forecast.set_index('ds').loc[training_series.index]['yhat']
+                mse, _, _ = metrics(training_series - fitted_vals)
+                return {'mse': mse, 'fit': fitted_vals, 'forecast': pd.Series(forecast['yhat'].iloc[len(training_series):].values, index=future['ds'].iloc[len(training_series):])}
+            except Exception as e: 
+                logger.warning(f"Prophet Error: {e}")
+                return None
 
-            # Initialize and fit Prophet model
-            # Assuming yearly seasonality for typical sales data
-            model_prophet = Prophet(yearly_seasonality=True, daily_seasonality=False, weekly_seasonality=False)
-            model_prophet.fit(df_prophet)
+        # --- SELECTION LOGIC ---
+        
+        # If specific model selected, run ONLY that one
+        if model_type == "ses":
+            res = run_ses()
+            if res: models_run["Single Exponential Smoothing (SES)"] = res
+            
+        elif model_type == "des":
+            res = run_des()
+            if res: models_run["Double Exponential Smoothing (DES)"] = res
+            
+        elif model_type == "tes":
+            res = run_tes()
+            if res: models_run["Triple Exponential Smoothing (TES)"] = res
+            
+        elif model_type == "prophet":
+            res = run_prophet()
+            if res: models_run["Prophet"] = res
 
-            # Create future DataFrame for both historical and forecast periods
-            future = model_prophet.make_future_dataframe(periods=forecast_steps, freq='MS')
+        # NOTE: Triple quotes """ """ break the if/else chain. 
+        # Use # to comment out code inside logic blocks.
+        # elif model_type == "arima":
+        #    res = run_arima()
+        #    if res: models_run["ARIMA"] = res
+            
+        else: # "auto" or unknown -> Run ALL and compare
+            res_ses = run_ses()
+            if res_ses: models_run["SES"] = res_ses
+            
+            res_des = run_des()
+            if res_des: models_run["DES"] = res_des
+            
+            res_tes = run_tes()
+            if res_tes: models_run["TES"] = res_tes
+            
+            res_pp = run_prophet()
+            if res_pp: models_run["Prophet"] = res_pp
+            
+            # res_arima = run_arima()
+            # if res_arima: models_run["ARIMA"] = res_arima
 
-            # Make predictions
-            prophet_predictions = model_prophet.predict(future)
+        # Filter out failed models
+        models_run = {k: v for k, v in models_run.items() if v is not None}
 
-            # Extract fitted values for historical data (yhat corresponding to training_series.index)
-            # Ensure the index aligns or create a series from the predictions for historical dates
-            prophet_fitted_values = prophet_predictions.set_index('ds').loc[training_series.index]['yhat']
+        if not models_run:
+             raise HTTPException(status_code=500, detail="All models failed. Check data format.")
 
-            residuals_prophet = training_series - prophet_fitted_values
-            mse_prophet, _, _ = metrics(residuals_prophet)
+        best_model_name = min(models_run, key=lambda k: models_run[k]['mse'])
+        best_result = models_run[best_model_name]
+        
+        logger.info(f"Winner: {best_model_name}")
 
-            # Store Prophet's fitted and forecasted values for potential selection
-            best_fit_values_prophet = pd.Series(
-                prophet_predictions['yhat'].iloc[:len(training_series)].values,
-                index=training_series.index
-            )
-            best_forecast_values_prophet = pd.Series(
-                prophet_predictions['yhat'].iloc[len(training_series):].values,
-                index=future['ds'].iloc[len(training_series):]
-            )
-
-        except Exception as e:
-            print(f"Prophet Failed: {e}")
-
-        # --- MODEL SELECTION ---
-        best_model_name = ""
-        best_fit_values = None
-        best_forecast_values = None
-
-        # Include mse_prophet in the comparison
-        min_mse = min(mse_ses, mse_des, mse_tes, mse_prophet)
-
-        if min_mse == mse_ses:
-            best_model_name = "SES"
-            best_fit_values = fit_ses.fittedvalues
-            best_forecast_values = fit_ses.forecast(forecast_steps)
-        elif min_mse == mse_des:
-            best_model_name = "DES"
-            best_fit_values = fit_des.fittedvalues
-            best_forecast_values = fit_des.forecast(forecast_steps)
-        elif min_mse == mse_tes:
-            best_model_name = "TES"
-            best_fit_values = fit_tes.fittedvalues
-            best_forecast_values = fit_tes.forecast(forecast_steps)
-        elif min_mse == mse_prophet:
-            best_model_name = "PP"
-            best_fit_values = best_fit_values_prophet
-            best_forecast_values = best_forecast_values_prophet
-
-        print(f"Selected Model: {best_model_name}")
-
-        # --- PREPARE RESPONSE ---
+        # --- RESPONSE ---
         history_data = []
+        best_fit_values = best_result['fit']
         for date_idx, actual_val in training_series.items():
             fitted_val = None
-            # Ensure best_fit_values is not None and index exists before trying to access
-            if best_fit_values is not None and date_idx in best_fit_values.index:
+            if date_idx in best_fit_values.index:
                 val = best_fit_values.loc[date_idx]
                 if not np.isnan(val) and not np.isinf(val):
                     fitted_val = int(round(val))
             history_data.append({"name": date_idx.strftime('%b %Y'), "actual": int(round(actual_val)), "fitted": fitted_val})
 
-        # Bridge Gap: This logic might need refinement if fitted and forecast are strictly separate.
-        # For now, it copies the last fitted value to forecast if it's the bridge point.
         if len(history_data) > 0:
             last_point = history_data[-1]
-            # This assumes the last fitted point is the first point of the forecast bridge.
-            # For Prophet, fitted values are for historical data, forecast is strictly future.
-            # We don't need to 'bridge' by copying fitted to forecast as they are distinct.
-            # The `forecast` list will start where `history` ends.
-            pass # Removing the bridge gap logic as it's not universally applicable and can be confusing.
+            if last_point["fitted"] is not None:
+                last_point["forecast"] = last_point["fitted"]
 
         forecast_data = []
-        if best_forecast_values is not None:
-            for date_idx, val in best_forecast_values.items():
-                clean_val = 0
-                if not np.isnan(val) and not np.isinf(val):
-                    clean_val = int(round(val))
-                forecast_data.append({"name": date_idx.strftime('%b %Y') + " (fc)", "forecast": clean_val})
+        best_forecast_values = best_result['forecast']
+        for date_idx, val in best_forecast_values.items():
+            clean_val = 0
+            if not np.isnan(val) and not np.isinf(val):
+                clean_val = int(round(val))
+            forecast_data.append({"name": date_idx.strftime('%b %Y') + " (fc)", "forecast": clean_val})
 
         return {
             "history": history_data,
             "forecast": forecast_data,
             "model_name": best_model_name,
+            "mode": model_type,
             "message": "Success"
         }
 
-    except HTTPException as he:
-        # Pass through our custom errors (like the 400 we raised above)
-        raise he
     except Exception as e:
-        # Catch unexpected server crashes
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+        logger.error(f"Global Server Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
