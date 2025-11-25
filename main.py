@@ -1,26 +1,34 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
 import io
-import os
+import logging
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from prophet import Prophet
 from pmdarima import auto_arima
 import warnings
 
-# Suppress warnings
+# --- CONFIGURATION ---
 warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sales_forecaster")
 
 app = FastAPI()
 
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False, # strictly False for wildcard
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- 1. HEALTH CHECK (Fixes the 404 error) ---
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "Backend is running smoothly!"}
 
 def metrics(residuals):
     residuals = residuals.dropna()
@@ -37,32 +45,33 @@ async def predict_sales(
     model_type: str = Form("auto") 
 ):
     try:
+        logger.info(f"--- NEW REQUEST: {file.filename} [{model_type}] ---")
         contents = await file.read()
         
         # --- SAFE LOAD ---
         try:
             df = pd.read_excel(io.BytesIO(contents))
-        except:
-             raise HTTPException(status_code=400, detail="The uploaded file does not satisfy the requirements above")
+        except Exception as e:
+            logger.error(f"File Load Error: {e}")
+            raise HTTPException(status_code=400, detail="Could not read Excel file.")
 
         df.columns = df.columns.astype(str).str.strip()
         required_columns = ['Period', 'Sales_quantity']
         if not all(col in df.columns for col in required_columns):
-             raise HTTPException(status_code=400, detail="The uploaded file does not satisfy the requirements above")
+             raise HTTPException(status_code=400, detail=f"Missing columns. Required: {required_columns}")
 
         try:
             df['Period'] = pd.to_datetime(df['Period'])
             df = df.set_index('Period')
             df = df.sort_index()
         except:
-             raise HTTPException(status_code=400, detail="The uploaded file does not satisfy the requirements above")
+             raise HTTPException(status_code=400, detail="Period column must be dates.")
         
         df = df.fillna(0)
         if df.index.freq is None:
             try:
                 df.index.freq = pd.infer_freq(df.index)
-            except:
-                pass
+            except: pass
         if df.index.freq is None:
              df = df.asfreq('MS')
              df = df.fillna(0)
@@ -74,30 +83,40 @@ async def predict_sales(
         # --- MODEL FUNCTIONS ---
         def run_ses():
             try:
+                logger.info("Running SES...")
                 model = ExponentialSmoothing(training_series, trend=None, seasonal=None)
                 fit = model.fit(optimized=True)
                 mse, _, _ = metrics(training_series - fit.fittedvalues)
                 return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
-            except: return None
+            except Exception as e: 
+                logger.warning(f"SES Error: {e}")
+                return None
 
         def run_des():
             try:
+                logger.info("Running DES...")
                 model = ExponentialSmoothing(training_series, trend="add", seasonal=None)
                 fit = model.fit(optimized=True)
                 mse, _, _ = metrics(training_series - fit.fittedvalues)
                 return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
-            except: return None
+            except Exception as e: 
+                logger.warning(f"DES Error: {e}")
+                return None
 
         def run_tes():
             try:
+                logger.info("Running TES...")
                 model = ExponentialSmoothing(training_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS')
                 fit = model.fit(optimized=True)
                 mse, _, _ = metrics(training_series - fit.fittedvalues)
                 return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
-            except: return None
+            except Exception as e: 
+                logger.warning(f"TES Error: {e}")
+                return None
 
         def run_prophet():
             try:
+                logger.info("Running Prophet...")
                 df_prophet = pd.DataFrame({'ds': training_series.index, 'y': training_series.values})
                 m = Prophet(yearly_seasonality=True, daily_seasonality=False, weekly_seasonality=False)
                 m.fit(df_prophet)
@@ -106,13 +125,18 @@ async def predict_sales(
                 
                 fitted_vals = forecast.set_index('ds').loc[training_series.index]['yhat']
                 mse, _, _ = metrics(training_series - fitted_vals)
-                
                 return {'mse': mse, 'fit': fitted_vals, 'forecast': pd.Series(forecast['yhat'].iloc[len(training_series):].values, index=future['ds'].iloc[len(training_series):])}
-            except: return None
+            except Exception as e: 
+                logger.warning(f"Prophet Error: {e}")
+                return None
 
         def run_arima():
             try:
-                model = auto_arima(training_series, seasonal=True, m=12, suppress_warnings=True, stepwise=True, error_action='ignore')
+                logger.info("Running ARIMA (This is slow)...")
+                # OPTIMIZATION: Limited max_p/max_q to prevent infinite hanging on free tier
+                model = auto_arima(training_series, seasonal=True, m=12, 
+                                 max_p=2, max_q=2, max_P=1, max_Q=1, 
+                                 suppress_warnings=True, stepwise=True, error_action='ignore')
                 fit = model.fit(training_series)
                 fitted_vals = pd.Series(model.predict_in_sample(), index=training_series.index)
                 mse, _, _ = metrics(training_series - fitted_vals)
@@ -120,26 +144,16 @@ async def predict_sales(
                 last_date = training_series.index[-1]
                 future_dates = pd.date_range(start=last_date, periods=forecast_steps + 1, freq='MS')[1:]
                 return {'mse': mse, 'fit': fitted_vals, 'forecast': pd.Series(forecast_vals, index=future_dates)}
-            except: return None
+            except Exception as e: 
+                logger.warning(f"ARIMA Error: {e}")
+                return None
 
         # --- SELECTION LOGIC ---
-        print(f"Running Mode: {model_type}")
-
-        if model_type == "ses":
-            res = run_ses()
-            if res: models_run["Single Exp. Smoothing (SES)"] = res
-        elif model_type == "des":
-            res = run_des()
-            if res: models_run["Double Exp. Smoothing (DES)"] = res
-        elif model_type == "tes":
-            res = run_tes()
-            if res: models_run["Triple Exp. Smoothing (TES)"] = res
-        elif model_type == "prophet":
-            res = run_prophet()
-            if res: models_run["Prophet"] = res
-        elif model_type == "arima":
-            res = run_arima()
-            if res: models_run["ARIMA"] = res
+        if model_type == "ses": models_run["SES"] = run_ses()
+        elif model_type == "des": models_run["DES"] = run_des()
+        elif model_type == "tes": models_run["TES"] = run_tes()
+        elif model_type == "prophet": models_run["Prophet"] = run_prophet()
+        elif model_type == "arima": models_run["ARIMA"] = run_arima()
         else: # "auto"
             res_ses = run_ses()
             if res_ses: models_run["SES"] = res_ses
@@ -149,16 +163,25 @@ async def predict_sales(
             if res_tes: models_run["TES"] = res_tes
             res_pp = run_prophet()
             if res_pp: models_run["Prophet"] = res_pp
+            
+            # --- CRITICAL CHANGE ---
+            # If dataset is large (>100 rows), ARIMA often kills the server on Free Tier.
+            # We will still try it, but log it explicitly.
             res_arima = run_arima()
             if res_arima: models_run["ARIMA"] = res_arima
 
+        # Filter out failed models (None results)
+        models_run = {k: v for k, v in models_run.items() if v is not None}
+
         if not models_run:
-             raise HTTPException(status_code=500, detail="Models failed to run. Check data quality.")
+             raise HTTPException(status_code=500, detail="All models failed. Check data format.")
 
         best_model_name = min(models_run, key=lambda k: models_run[k]['mse'])
         best_result = models_run[best_model_name]
+        
+        logger.info(f"Winner: {best_model_name}")
 
-        # --- RESPONSE ---
+        # --- FORMATTING RESPONSE ---
         history_data = []
         best_fit_values = best_result['fit']
         for date_idx, actual_val in training_series.items():
@@ -169,7 +192,6 @@ async def predict_sales(
                     fitted_val = int(round(val))
             history_data.append({"name": date_idx.strftime('%b %Y'), "actual": int(round(actual_val)), "fitted": fitted_val})
 
-        # BRIDGE
         if len(history_data) > 0:
             last_point = history_data[-1]
             if last_point["fitted"] is not None:
@@ -191,8 +213,6 @@ async def predict_sales(
             "message": "Success"
         }
 
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+        logger.error(f"Global Server Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
