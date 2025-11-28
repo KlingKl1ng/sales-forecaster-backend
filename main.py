@@ -98,7 +98,7 @@ async def predict_sales(
 
         def run_prophet():
             df_prophet = pd.DataFrame({'ds': training_series.index, 'y': training_series.values})
-            m = Prophet(yearly_seasonality=True, daily_seasonality=False, weekly_seasonality=False)
+            m = Prophet()
             m.fit(df_prophet)
             future = m.make_future_dataframe(periods=forecast_steps, freq='MS')
             forecast = m.predict(future)
