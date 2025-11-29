@@ -147,13 +147,6 @@ async def validate_models(
 
         # 2. WALK-FORWARD VALIDATION (Auto / All Possible Splits)
         elif validation_method == "walk_forward":
-            # Start from min_train, expand until we can't fit a test horizon
-            # e.g. Data=50, MinTrain=24, Test=6.
-            # Split 1: Train[0:24], Test[24:30]
-            # Split 2: Train[0:25], Test[25:31]
-            # ...
-            # Split N: Train[0:44], Test[44:50]
-            
             start_index = train_horizon
             end_index = total_len - test_horizon
             
@@ -176,7 +169,7 @@ async def validate_models(
                     mse = fit_and_score(m, train_s, test_s, test_horizon)
                     if mse is not None: models_results[m].append(mse)
 
-        # --- AGGREGATE RESULTS ---
+        # --- AGGREGATE SCORES ---
         final_scores = {}
         for m, errors in models_results.items():
             if errors:
@@ -188,11 +181,81 @@ async def validate_models(
         best_model_name = min(final_scores, key=final_scores.get)
         best_mse = final_scores[best_model_name]
 
+        # --- GENERATE PLOT DATA FOR WINNER (LAST SPLIT) ---
+        # Whether Simple or WFV, we visualize the performance on the *most recent* possible test set
+        # This helps user see "how it would have performed recently"
+        
+        last_train_end_idx = total_len - test_horizon
+        viz_train_series = full_series.iloc[:last_train_end_idx]
+        viz_test_series = full_series.iloc[last_train_end_idx:]
+        
+        viz_fitted = None
+        viz_forecast = None
+        
+        # Re-run best model on the viz split to get line data
+        try:
+            if best_model_name == 'ses':
+                m = ExponentialSmoothing(viz_train_series, trend=None, seasonal=None).fit(optimized=True)
+                viz_fitted = m.fittedvalues
+                viz_forecast = m.forecast(test_horizon)
+            elif best_model_name == 'des':
+                m = ExponentialSmoothing(viz_train_series, trend="add", seasonal=None).fit(optimized=True)
+                viz_fitted = m.fittedvalues
+                viz_forecast = m.forecast(test_horizon)
+            elif best_model_name == 'tes':
+                m = ExponentialSmoothing(viz_train_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS').fit(optimized=True)
+                viz_fitted = m.fittedvalues
+                viz_forecast = m.forecast(test_horizon)
+            elif best_model_name == 'prophet':
+                df_p = pd.DataFrame({'ds': viz_train_series.index, 'y': viz_train_series.values})
+                m = Prophet()
+                m.fit(df_p)
+                future = m.make_future_dataframe(periods=test_horizon, freq='MS')
+                fc_df = m.predict(future)
+                # Map back to series
+                viz_fitted = fc_df.set_index('ds').loc[viz_train_series.index]['yhat']
+                viz_forecast = pd.Series(fc_df.iloc[-test_horizon:]['yhat'].values, index=viz_test_series.index)
+        except Exception as e:
+            logger.warning(f"Visualization generation failed for {best_model_name}: {e}")
+
+        # Construct Response
+        history_data = []
+        if viz_fitted is not None:
+            for date_idx, actual_val in viz_train_series.items():
+                fitted_val = None
+                if date_idx in viz_fitted.index:
+                    val = viz_fitted.loc[date_idx]
+                    if not np.isnan(val): fitted_val = int(round(val))
+                history_data.append({
+                    "name": date_idx.strftime('%b %Y'), 
+                    "actual": int(round(actual_val)), 
+                    "fitted": fitted_val
+                })
+
+        forecast_data = []
+        if viz_forecast is not None:
+            for date_idx, val in viz_forecast.items():
+                clean_val = 0 if np.isnan(val) else int(round(val))
+                # Add ACTUAL to forecast data for comparison
+                actual_test_val = None
+                if date_idx in viz_test_series.index:
+                    actual_test_val = int(round(viz_test_series.loc[date_idx]))
+                
+                forecast_data.append({
+                    "name": date_idx.strftime('%b %Y') + " (val)", 
+                    "forecast": clean_val,
+                    "actual": actual_test_val # Include actuals in the forecast block
+                })
+
         return {
             "winner": best_model_name,
             "best_mse": best_mse if best_mse != float('inf') else 0,
             "details": final_scores,
-            "message": f"Winner: {best_model_name.upper()} (Avg MSE: {best_mse:.2f})"
+            "message": f"Winner: {best_model_name.upper()} (Avg MSE: {best_mse:.2f})",
+            # Include Chart Data
+            "model_name": best_model_name + " (Validation)",
+            "history": history_data,
+            "forecast": forecast_data
         }
 
     except HTTPException as he:
