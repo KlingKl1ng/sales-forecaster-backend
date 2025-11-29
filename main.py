@@ -90,7 +90,10 @@ async def predict_sales(
             return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
 
         def run_tes():
-            if len(training_series) < 24: return None
+            # FIXED: Raise ValueError instead of returning None so the exception is caught and reported
+            if len(training_series) < 24: 
+                raise ValueError("Insufficient data for TES (needs at least 24 periods/months)")
+            
             model = ExponentialSmoothing(training_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS')
             fit = model.fit(optimized=True)
             mse, _, _ = metrics(training_series - fit.fittedvalues)
@@ -120,6 +123,8 @@ async def predict_sales(
                 if res: models_run[model_type.upper()] = res
             except Exception as e:
                 logger.error(f"Model {model_type} failed: {e}")
+                # FIXED: Immediately raise error for manual selection so Frontend sees the specific reason
+                raise HTTPException(status_code=400, detail=f"Model {model_type} failed: {str(e)}")
         else:
             for name, func in available_models.items():
                 try:
