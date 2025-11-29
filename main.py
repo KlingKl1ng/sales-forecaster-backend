@@ -55,7 +55,8 @@ async def predict_sales(
 
         df.columns = df.columns.astype(str).str.strip()
         
-        required_columns = ['Period', 'Sales_quantity']
+        # UPDATED: Changed 'Sales_quantity' to 'Actual'
+        required_columns = ['Period', 'Actual']
         missing = [col for col in required_columns if col not in df.columns]
         if missing:
              raise HTTPException(status_code=400, detail=f"Missing required columns: {', '.join(missing)}")
@@ -72,7 +73,8 @@ async def predict_sales(
         if df.index.freq is None:
              df = df.asfreq('MS').fillna(0)
 
-        training_series = df['Sales_quantity']
+        # UPDATED: Mapping to 'Actual' column
+        training_series = df['Actual']
         forecast_steps = 6
         models_run = {} 
 
