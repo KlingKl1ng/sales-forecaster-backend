@@ -75,6 +75,11 @@ async def validate_models(
 ):
     try:
         logger.info(f"--- VALIDATION JOB: {file.filename} Train: {train_horizon} Test: {test_horizon} ---")
+        
+        # Guard clause for invalid test horizon
+        if test_horizon < 1:
+            raise HTTPException(status_code=400, detail="Test horizon must be at least 1 period.")
+
         contents = await file.read()
         full_series = load_and_prep_data(contents)
         
