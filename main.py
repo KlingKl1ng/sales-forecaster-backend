@@ -93,22 +93,29 @@ async def validate_models(
         full_series = load_and_prep_data(contents)
         total_len = len(full_series)
         
+        # Check constraint: Time Serie >= Train + Test
+        if total_len < train_horizon + test_horizon:
+             raise HTTPException(status_code=400, detail=f"Insufficient data. Length ({total_len}) must be >= Train ({train_horizon}) + Test ({test_horizon})")
+
         # --- DEFINING MODEL LOGIC (Reusable) ---
         def fit_and_score(model_code, train_data, test_data, horizon):
             try:
                 mse = float('inf')
+                fc_series = None
                 
                 if model_code == 'ses':
                     model = ExponentialSmoothing(train_data, trend=None, seasonal=None)
                     fit = model.fit(optimized=True)
                     fc = fit.forecast(horizon)
                     mse, _, _ = metrics(test_data - fc)
+                    fc_series = fc
                     
                 elif model_code == 'des':
                     model = ExponentialSmoothing(train_data, trend="add", seasonal=None)
                     fit = model.fit(optimized=True)
                     fc = fit.forecast(horizon)
                     mse, _, _ = metrics(test_data - fc)
+                    fc_series = fc
                     
                 elif model_code == 'tes':
                     if len(train_data) >= 24:
@@ -116,8 +123,9 @@ async def validate_models(
                         fit = model.fit(optimized=True)
                         fc = fit.forecast(horizon)
                         mse, _, _ = metrics(test_data - fc)
+                        fc_series = fc
                     else:
-                        return None # Not eligible
+                        return None, None 
                         
                 elif model_code == 'prophet':
                     df_p = pd.DataFrame({'ds': train_data.index, 'y': train_data.values})
@@ -129,54 +137,57 @@ async def validate_models(
                     fc_series = pd.Series(fc_vals, index=test_data.index)
                     mse, _, _ = metrics(test_data - fc_series)
                 
-                return mse
+                return mse, fc_series
             except Exception as e:
-                return None
+                return None, None
 
         # --- EXECUTION ---
         models_to_test = ["ses", "des", "tes", "prophet"] if model_type == "auto" else [model_type]
-        models_results = {m: [] for m in models_to_test} # Store list of MSEs
+        
+        # Dictionary to store list of MSEs for scoring
+        models_mse_list = {m: [] for m in models_to_test} 
+        # Dictionary to store the stitched forecast series
+        models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
 
         # 1. SIMPLE SPLIT
         if validation_method == "simple":
             total_required = train_horizon + test_horizon
-            if total_len < total_required:
-                raise HTTPException(status_code=400, detail=f"Data length ({total_len}) too short for requested split.")
-            
             validation_slice = full_series.iloc[-total_required:]
             train_s = validation_slice.iloc[:train_horizon]
             test_s = validation_slice.iloc[train_horizon:]
             
             for m in models_to_test:
-                mse = fit_and_score(m, train_s, test_s, test_horizon)
-                if mse is not None: models_results[m].append(mse)
+                mse, fc = fit_and_score(m, train_s, test_s, test_horizon)
+                if mse is not None: 
+                    models_mse_list[m].append(mse)
+                    models_stitched_forecasts[m] = fc
 
         # 2. WALK-FORWARD VALIDATION
         elif validation_method == "walk_forward":
             start_index = train_horizon
             end_index = total_len - test_horizon
             
-            if start_index > end_index:
-                 raise HTTPException(status_code=400, detail="Constraints impossible: Min Train + Test Horizon > Total Data")
-
-            step = 1
-            possible_folds = end_index - start_index + 1
-            if possible_folds > 10 and "prophet" in models_to_test:
-                step = max(1, possible_folds // 5) # Reduce folds for Prophet speed
+            # Step size = test_horizon to create non-overlapping blocks
+            step = test_horizon 
             
-            logger.info(f"Running WFV. Folds: {possible_folds}, Step: {step}")
+            logger.info(f"Running WFV. Start: {start_index}, End: {end_index}, Step: {step}")
 
             for i in range(start_index, end_index + 1, step):
                 train_s = full_series.iloc[:i]
                 test_s = full_series.iloc[i : i + test_horizon]
                 
                 for m in models_to_test:
-                    mse = fit_and_score(m, train_s, test_s, test_horizon)
-                    if mse is not None: models_results[m].append(mse)
+                    mse, fc = fit_and_score(m, train_s, test_s, test_horizon)
+                    if mse is not None: 
+                        models_mse_list[m].append(mse)
+                        if models_stitched_forecasts[m].empty:
+                             models_stitched_forecasts[m] = fc
+                        else:
+                             models_stitched_forecasts[m] = pd.concat([models_stitched_forecasts[m], fc])
 
         # --- AGGREGATE SCORES ---
         final_scores = {}
-        for m, errors in models_results.items():
+        for m, errors in models_mse_list.items():
             if errors:
                 final_scores[m] = np.mean(errors) 
         
@@ -187,66 +198,69 @@ async def validate_models(
         best_mse = final_scores[best_model_code]
         best_model_display_name = MODEL_DISPLAY_NAMES.get(best_model_code, best_model_code)
 
-        # --- GENERATE PLOT DATA FOR WINNER (LAST SPLIT) ---
-        last_train_end_idx = total_len - test_horizon
-        viz_train_series = full_series.iloc[:last_train_end_idx]
-        viz_test_series = full_series.iloc[last_train_end_idx:]
+        # --- PREPARE VISUALIZATION DATA ---
         
-        viz_fitted = None
-        viz_forecast = None
+        # 1. Determine Forecast/Validation Period
+        winner_forecast_series = models_stitched_forecasts[best_model_code]
+        if winner_forecast_series.empty:
+             raise HTTPException(status_code=500, detail="Winner produced no forecast data.")
+             
+        forecast_start_date = winner_forecast_series.index[0]
         
-        # Re-run best model on the viz split
+        # 2. Determine History Period (Training Data)
+        viz_history_series = full_series[full_series.index < forecast_start_date]
+        
+        # 3. GENERATE FITTED VALUES FOR HISTORY (The Dash Line)
+        viz_fitted_values = None
         try:
             if best_model_code == 'ses':
-                m = ExponentialSmoothing(viz_train_series, trend=None, seasonal=None).fit(optimized=True)
-                viz_fitted = m.fittedvalues
-                viz_forecast = m.forecast(test_horizon)
+                m = ExponentialSmoothing(viz_history_series, trend=None, seasonal=None).fit(optimized=True)
+                viz_fitted_values = m.fittedvalues
             elif best_model_code == 'des':
-                m = ExponentialSmoothing(viz_train_series, trend="add", seasonal=None).fit(optimized=True)
-                viz_fitted = m.fittedvalues
-                viz_forecast = m.forecast(test_horizon)
+                m = ExponentialSmoothing(viz_history_series, trend="add", seasonal=None).fit(optimized=True)
+                viz_fitted_values = m.fittedvalues
             elif best_model_code == 'tes':
-                m = ExponentialSmoothing(viz_train_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS').fit(optimized=True)
-                viz_fitted = m.fittedvalues
-                viz_forecast = m.forecast(test_horizon)
+                if len(viz_history_series) >= 24:
+                     m = ExponentialSmoothing(viz_history_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS').fit(optimized=True)
+                     viz_fitted_values = m.fittedvalues
             elif best_model_code == 'prophet':
-                df_p = pd.DataFrame({'ds': viz_train_series.index, 'y': viz_train_series.values})
+                df_p = pd.DataFrame({'ds': viz_history_series.index, 'y': viz_history_series.values})
                 m = Prophet()
                 m.fit(df_p)
-                future = m.make_future_dataframe(periods=test_horizon, freq='MS')
-                fc_df = m.predict(future)
-                viz_fitted = fc_df.set_index('ds').loc[viz_train_series.index]['yhat']
-                viz_forecast = pd.Series(fc_df.iloc[-test_horizon:]['yhat'].values, index=viz_test_series.index)
+                fc = m.predict(df_p)
+                viz_fitted_values = pd.Series(fc['yhat'].values, index=viz_history_series.index)
         except Exception as e:
-            logger.warning(f"Visualization generation failed for {best_model_code}: {e}")
+            logger.warning(f"Failed to generate fitted history for validation chart: {e}")
 
-        # Construct Response
+        # 4. Construct Response
+        viz_validation_actuals = full_series[full_series.index.isin(winner_forecast_series.index)]
+
         history_data = []
-        if viz_fitted is not None:
-            for date_idx, actual_val in viz_train_series.items():
-                fitted_val = None
-                if date_idx in viz_fitted.index:
-                    val = viz_fitted.loc[date_idx]
-                    if not np.isnan(val): fitted_val = int(round(val))
-                history_data.append({
-                    "name": date_idx.strftime('%b %Y'), 
-                    "actual": int(round(actual_val)), 
-                    "fitted": fitted_val
-                })
+        for date_idx, actual_val in viz_history_series.items():
+            fitted_val = None
+            # Map fitted value if available
+            if viz_fitted_values is not None and date_idx in viz_fitted_values.index:
+                val = viz_fitted_values.loc[date_idx]
+                if not np.isnan(val): fitted_val = int(round(val))
+
+            history_data.append({
+                "name": date_idx.strftime('%b %Y'), 
+                "actual": int(round(actual_val)), 
+                "fitted": fitted_val # Include fitted line for training part
+            })
 
         forecast_data = []
-        if viz_forecast is not None:
-            for date_idx, val in viz_forecast.items():
-                clean_val = 0 if np.isnan(val) else int(round(val))
-                actual_test_val = None
-                if date_idx in viz_test_series.index:
-                    actual_test_val = int(round(viz_test_series.loc[date_idx]))
-                
-                forecast_data.append({
-                    "name": date_idx.strftime('%b %Y') + " (val)", 
-                    "forecast": clean_val,
-                    "actual": actual_test_val 
-                })
+        for date_idx, val in winner_forecast_series.items():
+            clean_val = 0 if np.isnan(val) else int(round(val))
+            actual_val = None
+            if date_idx in viz_validation_actuals.index:
+                actual_val = int(round(viz_validation_actuals.loc[date_idx]))
+            
+            forecast_data.append({
+                "name": date_idx.strftime('%b %Y') + " (val)", 
+                "forecast": clean_val,
+                "actual": actual_val 
+            })
 
         return {
             "winner_code": best_model_code, 
@@ -270,7 +284,7 @@ async def validate_models(
 @app.post("/predict")
 async def predict_sales(
     file: UploadFile = File(...),
-    model_type: str = Form("auto"),
+    model_type: str = Form(...), 
     forecast_steps: int = Form(6)
 ):
     try:
@@ -317,24 +331,20 @@ async def predict_sales(
             "prophet": run_prophet
         }
 
-        if model_type != "auto" and model_type in available_models:
+        # Strict model execution (no auto loop)
+        if model_type in available_models:
             try:
                 res = available_models[model_type]()
-                if res: models_run[model_type.upper()] = res
+                if res: models_run[model_type] = res
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Model {model_type} failed: {str(e)}")
         else:
-            for name, func in available_models.items():
-                try:
-                    res = func()
-                    if res: models_run[name.upper()] = res
-                except Exception as e:
-                    logger.warning(f"Auto-run model {name} failed: {e}")
+             raise HTTPException(status_code=400, detail=f"Unknown model type: {model_type}")
 
         if not models_run:
-             raise HTTPException(status_code=500, detail="All forecasting models failed.")
+             raise HTTPException(status_code=500, detail="Forecasting failed.")
 
-        best_model_code = min(models_run, key=lambda k: models_run[k]['mse'])
+        best_model_code = list(models_run.keys())[0] 
         best_result = models_run[best_model_code]
         best_model_display_name = MODEL_DISPLAY_NAMES.get(best_model_code, best_model_code)
         
@@ -364,7 +374,7 @@ async def predict_sales(
             "history": history_data,
             "forecast": forecast_data,
             "model_name": best_model_display_name,
-            "forecast_mse": best_result['mse'], # Added Forecast MSE to response
+            "forecast_mse": best_result['mse'],
             "mode": model_type,
             "message": "Optimization Complete"
         }
