@@ -245,8 +245,8 @@ async def validate_models(
 
             history_data.append({
                 "name": date_idx.strftime('%b %Y'), 
-                "actual": int(round(actual_val)), 
-                "fitted": fitted_val # Include fitted line for training part
+                "actual_train": int(round(actual_val)), # REPLACED 'actual' with 'actual_train'
+                "fitted": fitted_val 
             })
 
         forecast_data = []
@@ -259,7 +259,7 @@ async def validate_models(
             forecast_data.append({
                 "name": date_idx.strftime('%b %Y') + " (val)", 
                 "forecast": clean_val,
-                "actual": actual_val 
+                "actual_test": actual_val # REPLACED 'actual' with 'actual_test'
             })
 
         return {
@@ -357,7 +357,7 @@ async def predict_sales(
                 if not np.isnan(val): fitted_val = int(round(val))
             history_data.append({
                 "name": date_idx.strftime('%b %Y'), 
-                "actual": int(round(actual_val)), 
+                "actual_train": int(round(actual_val)), # REPLACED 'actual' with 'actual_train'
                 "fitted": fitted_val
             })
 
