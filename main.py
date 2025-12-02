@@ -78,7 +78,7 @@ MODEL_DISPLAY_NAMES = {
     "prophet": "Prophet (Complex)"
 }
 
-# --- NEW: HELPER FOR EXPORT ---
+# --- HELPER FOR EXPORT ---
 def _run_model_logic(series, model_code, steps):
     try:
         if model_code == 'ses':
@@ -169,17 +169,21 @@ async def validate_models(
         models_mse_list = {m: [] for m in models_to_test} 
         models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
 
+        # --- LOGIC UPDATE: SIMPLE SPLIT (FIRST RUN) ---
         if validation_method == "simple":
-            total_required = train_horizon + test_horizon
-            validation_slice = full_series.iloc[-total_required:]
+            # UPDATED: Take the slice from the START (0 to train+test)
+            validation_slice = full_series.iloc[:train_horizon + test_horizon]
+            
             train_s = validation_slice.iloc[:train_horizon]
             test_s = validation_slice.iloc[train_horizon:]
+            
             for m in models_to_test:
                 mse, fc = fit_and_score(m, train_s, test_s, test_horizon)
                 if mse is not None: 
                     models_mse_list[m].append(mse)
                     models_stitched_forecasts[m] = fc
 
+        # --- WALK-FORWARD VALIDATION ---
         elif validation_method == "walk_forward":
             start_index = train_horizon
             end_index = total_len - test_horizon
@@ -209,7 +213,11 @@ async def validate_models(
         winner_forecast_series = models_stitched_forecasts[best_model_code]
         if winner_forecast_series.empty: raise HTTPException(status_code=500, detail="Winner produced no forecast data.")
              
+        # Visualization Data Construction
         forecast_start_date = winner_forecast_series.index[0]
+        
+        # NOTE: For the new Simple Split logic, this history series will automatically
+        # be cut off at the start of the forecast (e.g., period 12), exactly as requested.
         viz_history_series = full_series[full_series.index < forecast_start_date]
         
         viz_fitted_values = None
@@ -366,7 +374,7 @@ async def predict_sales(
         logger.error(f"Global Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: EXPORT ENDPOINT ---
+# --- EXPORT ENDPOINT ---
 @app.post("/export")
 async def export_report(
     file: UploadFile = File(...),
@@ -380,14 +388,19 @@ async def export_report(
         contents = await file.read()
         full_series = load_and_prep_data(contents)
         
-        # 1. RUN VALIDATION
+        # 1. RUN VALIDATION (Using updated logic: FIRST SLICE)
         if len(full_series) <= test_horizon:
              raise HTTPException(status_code=400, detail="Not enough data for validation export")
-        train_subset = full_series.iloc[:-test_horizon]
+        
+        # Apply the same "Simple Split" logic here: Slice from start
+        # Use only first (train + test) rows for this validation context
+        validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
+        train_subset = validation_scope_df.iloc[:train_horizon]
+        
         val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
         if val_forecast is None: raise HTTPException(status_code=500, detail="Validation model failed")
 
-        # 2. RUN FUTURE FORECAST
+        # 2. RUN FUTURE FORECAST (On full series)
         future_forecast = _run_model_logic(full_series, model_type, forecast_steps)
         if future_forecast is None: raise HTTPException(status_code=500, detail="Forecast model failed")
 
@@ -399,7 +412,6 @@ async def export_report(
         master_df['Validation (Backtest)'] = val_forecast
         master_df['Forecast (Future)'] = future_forecast
         
-        # Safe Division for Accuracy
         master_df['Accuracy Delta %'] = master_df.apply(
             lambda row: (row['Validation (Backtest)'] - row['Actual']) / row['Actual'] 
             if (pd.notna(row['Actual']) and row['Actual'] != 0 and pd.notna(row['Validation (Backtest)'])) else None, 
@@ -411,101 +423,59 @@ async def export_report(
         workbook = xlsxwriter.Workbook(output, {'in_memory': True})
         worksheet = workbook.add_worksheet("Operartis Report")
         
-        # --- PALETTE (Based on your Web App) ---
-        COLOR_BG_HEADER = '#1e293b' # Dark Slate (App Sidebar)
-        COLOR_TEXT_HEADER = '#ffffff'
-        COLOR_BRAND_GOLD = '#b45309' # Dark Gold
-        COLOR_BG_FORECAST = '#fffbeb' # Light Amber
-        COLOR_BG_VALIDATION = '#f8fafc' # Light Slate
-        COLOR_BORDER = '#cbd5e1'
-        
-        # Formats
         fmt_header_main = workbook.add_format({'bold': True, 'font_size': 20, 'font_color': '#b45309', 'align': 'left', 'valign': 'vcenter'})
         fmt_header_sub = workbook.add_format({'italic': True, 'font_color': '#b45309', 'align': 'left', 'valign': 'top'})
         fmt_meta_label = workbook.add_format({'bold': True, 'font_size': 9, 'font_color': '#475569', 'bg_color': '#f1f5f9', 'border': 1, 'align': 'left'})
         fmt_meta_value = workbook.add_format({'font_size': 9, 'font_color': '#0f172a', 'bg_color': '#ffffff', 'border': 1, 'align': 'left'})
+        fmt_table_header = workbook.add_format({'bold': True, 'font_color': 'white', 'bg_color': '#1e293b', 'border': 1, 'align': 'center'})
+        fmt_date = workbook.add_format({'num_format': 'mmm yyyy', 'border': 1, 'align': 'left'})
+        fmt_num = workbook.add_format({'num_format': '#,##0', 'border': 1, 'align': 'right'})
+        fmt_pct = workbook.add_format({'num_format': '0.0%', 'border': 1, 'align': 'center'})
+        fmt_val_col = workbook.add_format({'num_format': '#,##0', 'font_color': '#64748b', 'italic': True, 'border': 1, 'align': 'right'})
+        fmt_fc_col = workbook.add_format({'num_format': '#,##0', 'bold': True, 'font_color': '#b45309', 'bg_color': '#fffbeb', 'border': 1, 'align': 'right'}) 
         
-        fmt_table_header = workbook.add_format({'bold': True, 'font_color': COLOR_TEXT_HEADER, 'bg_color': COLOR_BG_HEADER, 'border': 1, 'align': 'center', 'valign': 'vcenter'})
-        
-        base_border = {'border': 1, 'border_color': COLOR_BORDER, 'font_name': 'Arial', 'font_size': 10}
-        fmt_date = workbook.add_format({**base_border, 'num_format': 'mmm yyyy', 'align': 'left', 'bold': True, 'font_color': '#475569'})
-        fmt_num = workbook.add_format({**base_border, 'num_format': '#,##0', 'align': 'right'})
-        fmt_pct = workbook.add_format({**base_border, 'num_format': '0.0%', 'align': 'center'})
-        fmt_val_col = workbook.add_format({**base_border, 'num_format': '#,##0', 'font_color': '#64748b', 'italic': True, 'align': 'right', 'bg_color': COLOR_BG_VALIDATION})
-        fmt_fc_col = workbook.add_format({**base_border, 'num_format': '#,##0', 'bold': True, 'font_color': '#b45309', 'bg_color': COLOR_BG_FORECAST, 'align': 'right'}) 
-        
-        # Layout matching screenshot
-        # Set Columns: A=Margin, B=Period(Wide), C=Actual, D=Val, E=Delta, F=Forecast
-        worksheet.set_column('A:A', 2)   # Margin
-        worksheet.set_column('B:B', 22)  # Period / Logo Anchor (Expanded to 22 as requested)
-        worksheet.set_column('C:C', 20)  # Actual
-        worksheet.set_column('D:D', 25)  # Validation
-        worksheet.set_column('E:E', 20)  # Delta
-        worksheet.set_column('F:F', 25)  # Forecast
+        worksheet.set_column('A:A', 2)   
+        worksheet.set_column('B:B', 22)  
+        worksheet.set_column('C:C', 20)  
+        worksheet.set_column('D:D', 25)  
+        worksheet.set_column('E:E', 20)  
+        worksheet.set_column('F:F', 25)  
 
         logo_path = "icononly_transparent_nobuffer.png" 
         if os.path.exists(logo_path):
-            # Anchor at B2, scale 0.04 (Small), with offsets if needed to center in B2-B4 visual space
-            worksheet.insert_image('B2', logo_path, {'x_scale': 0.04, 'y_scale': 0.04, 'x_offset': 50, 'y_offset': 5})
+            worksheet.insert_image('B2', logo_path, {'x_scale': 0.04, 'y_scale': 0.04, 'x_offset': 5, 'y_offset': 5})
             
-        # Row Heights
-        worksheet.set_row(1, 45) # Row 2 (Title)
-        worksheet.set_row(2, 25) # Row 3 (Slogan)
+        worksheet.set_row(1, 45) 
+        worksheet.set_row(2, 25) 
 
-        # Title & Slogan: Merge C2:F2 (next to logo)
         worksheet.merge_range('C2:F2', "OPERARTIS INTELLIGENCE REPORT", fmt_header_main)
         worksheet.merge_range('C3:F3', "Optimizing Today, Growing Tomorrow.", fmt_header_sub)
         
-        # Metadata Block (Row 5+)
-        # "Report By" row added as requested
         worksheet.write('B5', "Report By:", fmt_meta_label)
         worksheet.write('C5', "Operartis Analytics", fmt_meta_value)
-        
         worksheet.write('B6', "Report Date:", fmt_meta_label)
         worksheet.write('C6', datetime.now().strftime("%Y-%m-%d %H:%M"), fmt_meta_value)
-        
         worksheet.write('B7', "Model Used:", fmt_meta_label)
         worksheet.write('C7', MODEL_DISPLAY_NAMES.get(model_type, model_type), fmt_meta_value)
         
-        # Dynamic Header
-        headers = [
-            "Period", 
-            "Actual History", 
-            f"Validation (Test {test_horizon} horizon)", 
-            "Accuracy Delta", 
-            "Future Forecast"
-        ]
-        
-        # Write Headers at Row 9
-        for i, h in enumerate(headers):
-            worksheet.write(9, i+1, h, fmt_table_header) # i+1 because we start at Col B
+        headers = ["Period", "Actual History", f"Validation (Test {test_horizon} horizon)", "Accuracy Delta", "Future Forecast"]
+        for col, h in enumerate(headers):
+            worksheet.write(9, col+1, h, fmt_table_header) 
             
-        row_idx = 10
+        row = 10
         for date_idx, data_row in master_df.iterrows():
-            worksheet.write_datetime(row_idx, 1, date_idx, fmt_date) # Col B
+            worksheet.write_datetime(row, 1, date_idx, fmt_date)
+            if not pd.isna(data_row['Actual']): worksheet.write_number(row, 2, data_row['Actual'], fmt_num)
+            else: worksheet.write(row, 2, "-", fmt_num)
+            if not pd.isna(data_row['Validation (Backtest)']): worksheet.write_number(row, 3, data_row['Validation (Backtest)'], fmt_val_col)
+            else: worksheet.write(row, 3, "", fmt_val_col)
+            if not pd.isna(data_row['Accuracy Delta %']): worksheet.write_number(row, 4, data_row['Accuracy Delta %'], fmt_pct)
+            else: worksheet.write(row, 4, "", fmt_pct)
+            if not pd.isna(data_row['Forecast (Future)']): worksheet.write_number(row, 5, data_row['Forecast (Future)'], fmt_fc_col)
+            else: worksheet.write(row, 5, "", fmt_fc_col)
+            row += 1
             
-            if not pd.isna(data_row['Actual']): worksheet.write_number(row_idx, 2, data_row['Actual'], fmt_num)
-            else: worksheet.write(row_idx, 2, "-", fmt_num)
-            
-            if not pd.isna(data_row['Validation (Backtest)']): worksheet.write_number(row_idx, 3, data_row['Validation (Backtest)'], fmt_val_col)
-            else: worksheet.write(row_idx, 3, "", fmt_val_col)
-            
-            if not pd.isna(data_row['Accuracy Delta %']): worksheet.write_number(row_idx, 4, data_row['Accuracy Delta %'], fmt_pct)
-            else: worksheet.write(row_idx, 4, "", fmt_pct)
-            
-            if not pd.isna(data_row['Forecast (Future)']): worksheet.write_number(row_idx, 5, data_row['Forecast (Future)'], fmt_fc_col)
-            else: worksheet.write(row_idx, 5, "", fmt_fc_col)
-            row_idx += 1
-            
-        # Conditional Formatting for Delta (Col E / Index 4)
-        # Apply to data range: Row 10 (index) to end
-        worksheet.conditional_format(10, 4, row_idx-1, 4, {
-            'type': '3_color_scale',
-            'min_color': "#f87171", 
-            'mid_color': "#ffffff", 
-            'max_color': "#4ade80" 
-        })
-
+        worksheet.conditional_format(10, 4, row-1, 4, {'type': '3_color_scale', 'min_color': "#f87171", 'mid_color': "#ffffff", 'max_color': "#4ade80"})
         worksheet.protect('Operartis', {'select_locked_cells': True, 'select_unlocked_cells': True})
         workbook.close()
         output.seek(0)
