@@ -411,8 +411,9 @@ async def export_report(
         workbook = xlsxwriter.Workbook(output, {'in_memory': True})
         worksheet = workbook.add_worksheet("Operartis Report")
         
-        fmt_header_main = workbook.add_format({'bold': True, 'font_size': 20, 'font_color': '#b45309', 'align': 'left', 'valign': 'vcenter'})
-        fmt_header_sub = workbook.add_format({'italic': True, 'font_color': '#64748b', 'align': 'left'})
+        # Formats
+        fmt_header_main = workbook.add_format({'bold': True, 'font_size': 20, 'font_color': '#b45309', 'align': 'left', 'valign': 'vcenter'}) # Left align
+        fmt_header_sub = workbook.add_format({'italic': True, 'font_color': '#b45309', 'align': 'left'}) # Left align, Brand Gold
         fmt_meta_label = workbook.add_format({'bold': True, 'font_size': 9, 'font_color': '#475569', 'bg_color': '#f1f5f9', 'border': 1})
         fmt_meta_value = workbook.add_format({'font_size': 9, 'font_color': '#0f172a', 'bg_color': '#ffffff', 'border': 1})
         fmt_table_header = workbook.add_format({'bold': True, 'font_color': 'white', 'bg_color': '#1e293b', 'border': 1, 'align': 'center'})
@@ -422,26 +423,35 @@ async def export_report(
         fmt_val_col = workbook.add_format({'num_format': '#,##0', 'font_color': '#64748b', 'italic': True, 'border': 1, 'align': 'right'})
         fmt_fc_col = workbook.add_format({'num_format': '#,##0', 'bold': True, 'font_color': '#b45309', 'bg_color': '#fffbeb', 'border': 1, 'align': 'right'}) 
         
-        logo_path = "icononly_transparent_nobuffer.png" 
-        if os.path.exists(logo_path):
-            # FIXED: Reduced scale to 0.08 (8%) to fit specific image size
-            worksheet.insert_image('A1', logo_path, {'x_scale': 0.08, 'y_scale': 0.08, 'x_offset': 5, 'y_offset': 5})
-            worksheet.set_row(0, 60) 
-        else:
-            worksheet.write('A1', "OPERARTIS", fmt_header_main)
+        # Layout matching screenshot
+        # Set Column A width (Period)
+        worksheet.set_column(0, 0, 22) # Period
+        worksheet.set_column(1, 1, 18) # Actual
+        worksheet.set_column(2, 4, 25) # Rest
 
-        worksheet.merge_range('C2:F2', "OPERARTIS INTELLIGENCE REPORT", fmt_header_main)
+        logo_path = "icononly_transparent_quadratic.png" 
+        if os.path.exists(logo_path):
+            # Anchor at B1, scale 0.05
+            worksheet.insert_image('B1', logo_path, {'x_scale': 0.055, 'y_scale': 0.05, 'x_offset': 30, 'y_offset': 0})
+            
+        # Merge C2:F2 for Title (to right of logo in B)
+        worksheet.merge_range('C2:F2', "OPERARTIS FORECAST REPORT", fmt_header_main)
         worksheet.merge_range('C3:F3', "Optimizing Today, Growing Tomorrow.", fmt_header_sub)
         
-        worksheet.write('B5', "Report Date:", fmt_meta_label)
-        worksheet.write('C5', datetime.now().strftime("%Y-%m-%d %H:%M"), fmt_meta_value)
-        worksheet.write('B6', "Model Used:", fmt_meta_label)
-        worksheet.write('C6', MODEL_DISPLAY_NAMES.get(model_type, model_type), fmt_meta_value)
+        # Metadata Block (Row 5+)
+        worksheet.write('B5', "Report By:", fmt_meta_label)
+        worksheet.write('C5', "Operartis Analytics", fmt_meta_value)
         
-        headers = ["Period", "Actual History", "Validation (Test)", "Accuracy Delta", "Future Forecast"]
+        worksheet.write('B6', "Report Date:", fmt_meta_label)
+        worksheet.write('C6', datetime.now().strftime("%Y-%m-%d %H:%M"), fmt_meta_value)
+        
+        worksheet.write('B7', "Model Used:", fmt_meta_label)
+        worksheet.write('C7', MODEL_DISPLAY_NAMES.get(model_type, model_type), fmt_meta_value)
+        
+        # Dynamic Header
+        headers = ["Period", "Actual History", f"Validation (Test {test_horizon} horizon)", "Accuracy Delta", "Future Forecast"]
         for col, h in enumerate(headers):
             worksheet.write(9, col, h, fmt_table_header)
-            worksheet.set_column(col, col, 20) 
             
         row = 10
         for date_idx, data_row in master_df.iterrows():
@@ -456,6 +466,7 @@ async def export_report(
             else: worksheet.write(row, 4, "", fmt_fc_col)
             row += 1
             
+        worksheet.protect('Operartis', {'select_locked_cells': True, 'select_unlocked_cells': True})
         workbook.close()
         output.seek(0)
         
