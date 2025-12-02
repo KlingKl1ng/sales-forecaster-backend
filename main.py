@@ -411,34 +411,53 @@ async def export_report(
         workbook = xlsxwriter.Workbook(output, {'in_memory': True})
         worksheet = workbook.add_worksheet("Operartis Report")
         
+        # --- PALETTE (Based on your Web App) ---
+        COLOR_BG_HEADER = '#1e293b' # Dark Slate (App Sidebar)
+        COLOR_TEXT_HEADER = '#ffffff'
+        COLOR_BRAND_GOLD = '#b45309' # Dark Gold
+        COLOR_BG_FORECAST = '#fffbeb' # Light Amber
+        COLOR_BG_VALIDATION = '#f8fafc' # Light Slate
+        COLOR_BORDER = '#cbd5e1'
+        
         # Formats
-        fmt_header_main = workbook.add_format({'bold': True, 'font_size': 20, 'font_color': '#b45309', 'align': 'left', 'valign': 'vcenter'}) # Left align
-        fmt_header_sub = workbook.add_format({'italic': True, 'font_color': '#b45309', 'align': 'left'}) # Left align, Brand Gold
-        fmt_meta_label = workbook.add_format({'bold': True, 'font_size': 9, 'font_color': '#475569', 'bg_color': '#f1f5f9', 'border': 1})
-        fmt_meta_value = workbook.add_format({'font_size': 9, 'font_color': '#0f172a', 'bg_color': '#ffffff', 'border': 1})
-        fmt_table_header = workbook.add_format({'bold': True, 'font_color': 'white', 'bg_color': '#1e293b', 'border': 1, 'align': 'center'})
-        fmt_date = workbook.add_format({'num_format': 'mmm yyyy', 'border': 1, 'align': 'left'})
-        fmt_num = workbook.add_format({'num_format': '#,##0', 'border': 1, 'align': 'right'})
-        fmt_pct = workbook.add_format({'num_format': '0.0%', 'border': 1, 'align': 'center'})
-        fmt_val_col = workbook.add_format({'num_format': '#,##0', 'font_color': '#64748b', 'italic': True, 'border': 1, 'align': 'right'})
-        fmt_fc_col = workbook.add_format({'num_format': '#,##0', 'bold': True, 'font_color': '#b45309', 'bg_color': '#fffbeb', 'border': 1, 'align': 'right'}) 
+        fmt_header_main = workbook.add_format({'bold': True, 'font_size': 20, 'font_color': '#b45309', 'align': 'left', 'valign': 'vcenter'})
+        fmt_header_sub = workbook.add_format({'italic': True, 'font_color': '#b45309', 'align': 'left', 'valign': 'top'})
+        fmt_meta_label = workbook.add_format({'bold': True, 'font_size': 9, 'font_color': '#475569', 'bg_color': '#f1f5f9', 'border': 1, 'align': 'left'})
+        fmt_meta_value = workbook.add_format({'font_size': 9, 'font_color': '#0f172a', 'bg_color': '#ffffff', 'border': 1, 'align': 'left'})
+        
+        fmt_table_header = workbook.add_format({'bold': True, 'font_color': COLOR_TEXT_HEADER, 'bg_color': COLOR_BG_HEADER, 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+        
+        base_border = {'border': 1, 'border_color': COLOR_BORDER, 'font_name': 'Arial', 'font_size': 10}
+        fmt_date = workbook.add_format({**base_border, 'num_format': 'mmm yyyy', 'align': 'left', 'bold': True, 'font_color': '#475569'})
+        fmt_num = workbook.add_format({**base_border, 'num_format': '#,##0', 'align': 'right'})
+        fmt_pct = workbook.add_format({**base_border, 'num_format': '0.0%', 'align': 'center'})
+        fmt_val_col = workbook.add_format({**base_border, 'num_format': '#,##0', 'font_color': '#64748b', 'italic': True, 'align': 'right', 'bg_color': COLOR_BG_VALIDATION})
+        fmt_fc_col = workbook.add_format({**base_border, 'num_format': '#,##0', 'bold': True, 'font_color': '#b45309', 'bg_color': COLOR_BG_FORECAST, 'align': 'right'}) 
         
         # Layout matching screenshot
-        # Set Column A width (Period)
-        worksheet.set_column(0, 0, 22) # Period
-        worksheet.set_column(1, 1, 18) # Actual
-        worksheet.set_column(2, 4, 25) # Rest
+        # Set Columns: A=Margin, B=Period(Wide), C=Actual, D=Val, E=Delta, F=Forecast
+        worksheet.set_column('A:A', 2)   # Margin
+        worksheet.set_column('B:B', 22)  # Period / Logo Anchor (Expanded to 22 as requested)
+        worksheet.set_column('C:C', 20)  # Actual
+        worksheet.set_column('D:D', 25)  # Validation
+        worksheet.set_column('E:E', 20)  # Delta
+        worksheet.set_column('F:F', 25)  # Forecast
 
-        logo_path = "icononly_transparent_quadratic.png" 
+        logo_path = "icononly_transparent_nobuffer.png" 
         if os.path.exists(logo_path):
-            # Anchor at B1, scale 0.05
-            worksheet.insert_image('B1', logo_path, {'x_scale': 0.055, 'y_scale': 0.05, 'x_offset': 30, 'y_offset': 0})
+            # Anchor at B2, scale 0.04 (Small), with offsets if needed to center in B2-B4 visual space
+            worksheet.insert_image('B2', logo_path, {'x_scale': 0.04, 'y_scale': 0.04, 'x_offset': 50, 'y_offset': 5})
             
-        # Merge C2:F2 for Title (to right of logo in B)
-        worksheet.merge_range('C2:F2', "OPERARTIS FORECAST REPORT", fmt_header_main)
+        # Row Heights
+        worksheet.set_row(1, 45) # Row 2 (Title)
+        worksheet.set_row(2, 25) # Row 3 (Slogan)
+
+        # Title & Slogan: Merge C2:F2 (next to logo)
+        worksheet.merge_range('C2:F2', "OPERARTIS INTELLIGENCE REPORT", fmt_header_main)
         worksheet.merge_range('C3:F3', "Optimizing Today, Growing Tomorrow.", fmt_header_sub)
         
         # Metadata Block (Row 5+)
+        # "Report By" row added as requested
         worksheet.write('B5', "Report By:", fmt_meta_label)
         worksheet.write('C5', "Operartis Analytics", fmt_meta_value)
         
@@ -449,23 +468,44 @@ async def export_report(
         worksheet.write('C7', MODEL_DISPLAY_NAMES.get(model_type, model_type), fmt_meta_value)
         
         # Dynamic Header
-        headers = ["Period", "Actual History", f"Validation (Test {test_horizon} horizon)", "Accuracy Delta", "Future Forecast"]
-        for col, h in enumerate(headers):
-            worksheet.write(9, col, h, fmt_table_header)
+        headers = [
+            "Period", 
+            "Actual History", 
+            f"Validation (Test {test_horizon} horizon)", 
+            "Accuracy Delta", 
+            "Future Forecast"
+        ]
+        
+        # Write Headers at Row 9
+        for i, h in enumerate(headers):
+            worksheet.write(9, i+1, h, fmt_table_header) # i+1 because we start at Col B
             
-        row = 10
+        row_idx = 10
         for date_idx, data_row in master_df.iterrows():
-            worksheet.write_datetime(row, 0, date_idx, fmt_date)
-            if not pd.isna(data_row['Actual']): worksheet.write_number(row, 1, data_row['Actual'], fmt_num)
-            else: worksheet.write(row, 1, "-", fmt_num)
-            if not pd.isna(data_row['Validation (Backtest)']): worksheet.write_number(row, 2, data_row['Validation (Backtest)'], fmt_val_col)
-            else: worksheet.write(row, 2, "", fmt_val_col)
-            if not pd.isna(data_row['Accuracy Delta %']): worksheet.write_number(row, 3, data_row['Accuracy Delta %'], fmt_pct)
-            else: worksheet.write(row, 3, "", fmt_pct)
-            if not pd.isna(data_row['Forecast (Future)']): worksheet.write_number(row, 4, data_row['Forecast (Future)'], fmt_fc_col)
-            else: worksheet.write(row, 4, "", fmt_fc_col)
-            row += 1
+            worksheet.write_datetime(row_idx, 1, date_idx, fmt_date) # Col B
             
+            if not pd.isna(data_row['Actual']): worksheet.write_number(row_idx, 2, data_row['Actual'], fmt_num)
+            else: worksheet.write(row_idx, 2, "-", fmt_num)
+            
+            if not pd.isna(data_row['Validation (Backtest)']): worksheet.write_number(row_idx, 3, data_row['Validation (Backtest)'], fmt_val_col)
+            else: worksheet.write(row_idx, 3, "", fmt_val_col)
+            
+            if not pd.isna(data_row['Accuracy Delta %']): worksheet.write_number(row_idx, 4, data_row['Accuracy Delta %'], fmt_pct)
+            else: worksheet.write(row_idx, 4, "", fmt_pct)
+            
+            if not pd.isna(data_row['Forecast (Future)']): worksheet.write_number(row_idx, 5, data_row['Forecast (Future)'], fmt_fc_col)
+            else: worksheet.write(row_idx, 5, "", fmt_fc_col)
+            row_idx += 1
+            
+        # Conditional Formatting for Delta (Col E / Index 4)
+        # Apply to data range: Row 10 (index) to end
+        worksheet.conditional_format(10, 4, row_idx-1, 4, {
+            'type': '3_color_scale',
+            'min_color': "#f87171", 
+            'mid_color': "#ffffff", 
+            'max_color': "#4ade80" 
+        })
+
         worksheet.protect('Operartis', {'select_locked_cells': True, 'select_unlocked_cells': True})
         workbook.close()
         output.seek(0)
