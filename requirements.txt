@@ -6,4 +6,5 @@ python-multipart
 openpyxl
 statsmodels
 prophet
-pmdarima
+#pmdarima
+xlsxwriter
