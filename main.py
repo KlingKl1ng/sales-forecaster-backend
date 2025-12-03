@@ -512,7 +512,7 @@ async def export_report(
         footer_row = row + 2
         worksheet.write(footer_row, 1, f"© {datetime.now().year} Operartis Analytics. All rights reserved.", fmt_footer)
 
-        worksheet.protect('Operartis', {'select_locked_cells': True, 'select_unlocked_cells': True})
+        worksheet.protect('Operartis020561', {'select_locked_cells': True, 'select_unlocked_cells': True})
         workbook.close()
         output.seek(0)
         
