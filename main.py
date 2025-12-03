@@ -78,7 +78,7 @@ MODEL_DISPLAY_NAMES = {
     "prophet": "Prophet (Complex)"
 }
 
-# --- HELPER FOR EXPORT ---
+# --- NEW: HELPER FOR EXPORT ---
 def _run_model_logic(series, model_code, steps):
     try:
         if model_code == 'ses':
@@ -169,11 +169,9 @@ async def validate_models(
         models_mse_list = {m: [] for m in models_to_test} 
         models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
 
-        # --- LOGIC UPDATE: SIMPLE SPLIT (FIRST RUN) ---
         if validation_method == "simple":
-            # UPDATED: Take the slice from the START (0 to train+test)
+            # UPDATED LOGIC: Simple Split = First valid run (Train 1..N -> Forecast N+1)
             validation_slice = full_series.iloc[:train_horizon + test_horizon]
-            
             train_s = validation_slice.iloc[:train_horizon]
             test_s = validation_slice.iloc[train_horizon:]
             
@@ -183,7 +181,6 @@ async def validate_models(
                     models_mse_list[m].append(mse)
                     models_stitched_forecasts[m] = fc
 
-        # --- WALK-FORWARD VALIDATION ---
         elif validation_method == "walk_forward":
             start_index = train_horizon
             end_index = total_len - test_horizon
@@ -213,11 +210,7 @@ async def validate_models(
         winner_forecast_series = models_stitched_forecasts[best_model_code]
         if winner_forecast_series.empty: raise HTTPException(status_code=500, detail="Winner produced no forecast data.")
              
-        # Visualization Data Construction
         forecast_start_date = winner_forecast_series.index[0]
-        
-        # NOTE: For the new Simple Split logic, this history series will automatically
-        # be cut off at the start of the forecast (e.g., period 12), exactly as requested.
         viz_history_series = full_series[full_series.index < forecast_start_date]
         
         viz_fitted_values = None
@@ -374,37 +367,55 @@ async def predict_sales(
         logger.error(f"Global Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- EXPORT ENDPOINT ---
+# --- NEW: EXPORT ENDPOINT ---
 @app.post("/export")
 async def export_report(
     file: UploadFile = File(...),
     model_type: str = Form(...),
+    validation_method: str = Form("simple"),
     train_horizon: int = Form(...),
     test_horizon: int = Form(...),
     forecast_steps: int = Form(...)
 ):
     try:
-        logger.info(f"Generating Report for {model_type}")
+        logger.info(f"Generating Report for {model_type} using {validation_method}")
         contents = await file.read()
         full_series = load_and_prep_data(contents)
         
-        # 1. RUN VALIDATION (Using updated logic: FIRST SLICE)
-        if len(full_series) <= test_horizon:
-             raise HTTPException(status_code=400, detail="Not enough data for validation export")
+        # --- 1. RUN VALIDATION (Conditional Logic) ---
+        val_forecast = None
         
-        # Apply the same "Simple Split" logic here: Slice from start
-        # Use only first (train + test) rows for this validation context
-        validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
-        train_subset = validation_scope_df.iloc[:train_horizon]
-        
-        val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
+        if validation_method == "simple":
+            # Logic: First Slice (Train 1..N -> Forecast N+1)
+            if len(full_series) < train_horizon + test_horizon:
+                 raise HTTPException(status_code=400, detail="Not enough data for simple validation")
+            
+            # Just take the slice required for the first run
+            validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
+            train_subset = validation_scope_df.iloc[:train_horizon]
+            val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
+
+        elif validation_method == "walk_forward":
+            # Logic: Loop through all windows
+            val_forecast_series = pd.Series(dtype='float64')
+            start_index = train_horizon
+            end_index = len(full_series) - test_horizon
+            step = test_horizon 
+            
+            for i in range(start_index, end_index + 1, step):
+                train_s = full_series.iloc[:i]
+                fc = _run_model_logic(train_s, model_type, test_horizon)
+                val_forecast_series = pd.concat([val_forecast_series, fc])
+            
+            val_forecast = val_forecast_series
+
         if val_forecast is None: raise HTTPException(status_code=500, detail="Validation model failed")
 
-        # 2. RUN FUTURE FORECAST (On full series)
+        # --- 2. RUN FUTURE FORECAST ---
         future_forecast = _run_model_logic(full_series, model_type, forecast_steps)
         if future_forecast is None: raise HTTPException(status_code=500, detail="Forecast model failed")
 
-        # 3. BUILD MASTER DATAFRAME
+        # --- 3. BUILD MASTER DATAFRAME ---
         all_dates = sorted(list(set(list(full_series.index) + list(future_forecast.index))))
         master_df = pd.DataFrame(index=all_dates)
         master_df.index.name = "Period"
@@ -418,7 +429,7 @@ async def export_report(
             axis=1
         )
         
-        # 4. EXCEL GENERATION
+        # --- 4. EXCEL GENERATION ---
         output = io.BytesIO()
         workbook = xlsxwriter.Workbook(output, {'in_memory': True})
         worksheet = workbook.add_worksheet("Operartis Report")
@@ -434,6 +445,7 @@ async def export_report(
         fmt_val_col = workbook.add_format({'num_format': '#,##0', 'font_color': '#64748b', 'italic': True, 'border': 1, 'align': 'right'})
         fmt_fc_col = workbook.add_format({'num_format': '#,##0', 'bold': True, 'font_color': '#b45309', 'bg_color': '#fffbeb', 'border': 1, 'align': 'right'}) 
         
+        # Layout matching screenshot
         worksheet.set_column('A:A', 2)   
         worksheet.set_column('B:B', 22)  
         worksheet.set_column('C:C', 20)  
@@ -443,7 +455,8 @@ async def export_report(
 
         logo_path = "icononly_transparent_nobuffer.png" 
         if os.path.exists(logo_path):
-            worksheet.insert_image('B2', logo_path, {'x_scale': 0.04, 'y_scale': 0.04, 'x_offset': 5, 'y_offset': 5})
+            # Anchor at B2, scale 0.05 (5% - adjusted based on previous feedback)
+            worksheet.insert_image('B2', logo_path, {'x_scale': 0.05, 'y_scale': 0.05})
             
         worksheet.set_row(1, 45) 
         worksheet.set_row(2, 25) 
@@ -453,11 +466,14 @@ async def export_report(
         
         worksheet.write('B5', "Report By:", fmt_meta_label)
         worksheet.write('C5', "Operartis Analytics", fmt_meta_value)
+        
         worksheet.write('B6', "Report Date:", fmt_meta_label)
         worksheet.write('C6', datetime.now().strftime("%Y-%m-%d %H:%M"), fmt_meta_value)
+        
         worksheet.write('B7', "Model Used:", fmt_meta_label)
         worksheet.write('C7', MODEL_DISPLAY_NAMES.get(model_type, model_type), fmt_meta_value)
         
+        # Dynamic Column Header
         headers = ["Period", "Actual History", f"Validation (Test {test_horizon} horizon)", "Accuracy Delta", "Future Forecast"]
         for col, h in enumerate(headers):
             worksheet.write(9, col+1, h, fmt_table_header) 
