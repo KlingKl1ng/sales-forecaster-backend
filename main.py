@@ -170,11 +170,9 @@ async def validate_models(
         models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
 
         if validation_method == "simple":
-            # UPDATED LOGIC: Simple Split = First valid run (Train 1..N -> Forecast N+1)
             validation_slice = full_series.iloc[:train_horizon + test_horizon]
             train_s = validation_slice.iloc[:train_horizon]
             test_s = validation_slice.iloc[train_horizon:]
-            
             for m in models_to_test:
                 mse, fc = fit_and_score(m, train_s, test_s, test_horizon)
                 if mse is not None: 
@@ -193,8 +191,17 @@ async def validate_models(
                     mse, fc = fit_and_score(m, train_s, test_s, test_horizon)
                     if mse is not None: 
                         models_mse_list[m].append(mse)
-                        if models_stitched_forecasts[m].empty: models_stitched_forecasts[m] = fc
-                        else: models_stitched_forecasts[m] = pd.concat([models_stitched_forecasts[m], fc])
+                        # LOGIC FOR CHART/STITCHING
+                        if test_horizon == 1:
+                             # Special case: concat all
+                             if models_stitched_forecasts[m].empty:
+                                 models_stitched_forecasts[m] = fc
+                             else:
+                                 models_stitched_forecasts[m] = pd.concat([models_stitched_forecasts[m], fc])
+                        else:
+                             # Standard case: Only keep the FIRST fold (matching simple logic)
+                             if models_stitched_forecasts[m].empty:
+                                 models_stitched_forecasts[m] = fc
 
         final_scores = {}
         for m, errors in models_mse_list.items():
@@ -372,50 +379,58 @@ async def predict_sales(
 async def export_report(
     file: UploadFile = File(...),
     model_type: str = Form(...),
-    validation_method: str = Form("simple"),
+    validation_method: str = Form("simple"), # ADDED
     train_horizon: int = Form(...),
     test_horizon: int = Form(...),
     forecast_steps: int = Form(...)
 ):
     try:
-        logger.info(f"Generating Report for {model_type} using {validation_method}")
+        logger.info(f"Generating Report for {model_type}")
         contents = await file.read()
         full_series = load_and_prep_data(contents)
         
-        # --- 1. RUN VALIDATION (Conditional Logic) ---
+        # --- 1. RUN VALIDATION ---
         val_forecast = None
+        if len(full_series) <= test_horizon:
+             raise HTTPException(status_code=400, detail="Not enough data for validation export")
         
+        # Determine validation data based on method
         if validation_method == "simple":
-            # Logic: First Slice (Train 1..N -> Forecast N+1)
-            if len(full_series) < train_horizon + test_horizon:
-                 raise HTTPException(status_code=400, detail="Not enough data for simple validation")
-            
-            # Just take the slice required for the first run
-            validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
-            train_subset = validation_scope_df.iloc[:train_horizon]
-            val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
-
+             # Just the first fold
+             validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
+             train_subset = validation_scope_df.iloc[:train_horizon]
+             val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
+        
         elif validation_method == "walk_forward":
-            # Logic: Loop through all windows
-            val_forecast_series = pd.Series(dtype='float64')
-            start_index = train_horizon
-            end_index = len(full_series) - test_horizon
-            step = test_horizon 
-            
-            for i in range(start_index, end_index + 1, step):
-                train_s = full_series.iloc[:i]
-                fc = _run_model_logic(train_s, model_type, test_horizon)
-                val_forecast_series = pd.concat([val_forecast_series, fc])
-            
-            val_forecast = val_forecast_series
+             # Logic matches the chart: 
+             # If test_horizon == 1: Stitch all folds
+             # If test_horizon > 1: Only the first fold
+             
+             if test_horizon > 1:
+                 # Behave like simple split (First Fold)
+                 validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
+                 train_subset = validation_scope_df.iloc[:train_horizon]
+                 val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
+             else:
+                 # Stitch everything
+                 val_forecast_series = pd.Series(dtype='float64')
+                 start_index = train_horizon
+                 end_index = len(full_series) - test_horizon
+                 step = test_horizon 
+                 
+                 for i in range(start_index, end_index + 1, step):
+                    train_s = full_series.iloc[:i]
+                    fc = _run_model_logic(train_s, model_type, test_horizon)
+                    val_forecast_series = pd.concat([val_forecast_series, fc])
+                 val_forecast = val_forecast_series
 
         if val_forecast is None: raise HTTPException(status_code=500, detail="Validation model failed")
 
-        # --- 2. RUN FUTURE FORECAST ---
+        # 2. RUN FUTURE FORECAST
         future_forecast = _run_model_logic(full_series, model_type, forecast_steps)
         if future_forecast is None: raise HTTPException(status_code=500, detail="Forecast model failed")
 
-        # --- 3. BUILD MASTER DATAFRAME ---
+        # 3. BUILD MASTER DATAFRAME
         all_dates = sorted(list(set(list(full_series.index) + list(future_forecast.index))))
         master_df = pd.DataFrame(index=all_dates)
         master_df.index.name = "Period"
@@ -423,13 +438,14 @@ async def export_report(
         master_df['Validation (Backtest)'] = val_forecast
         master_df['Forecast (Future)'] = future_forecast
         
+        # Safe Division for Accuracy
         master_df['Accuracy Delta %'] = master_df.apply(
             lambda row: (row['Validation (Backtest)'] - row['Actual']) / row['Actual'] 
             if (pd.notna(row['Actual']) and row['Actual'] != 0 and pd.notna(row['Validation (Backtest)'])) else None, 
             axis=1
         )
         
-        # --- 4. EXCEL GENERATION ---
+        # 4. EXCEL GENERATION
         output = io.BytesIO()
         workbook = xlsxwriter.Workbook(output, {'in_memory': True})
         worksheet = workbook.add_worksheet("Operartis Report")
@@ -455,8 +471,7 @@ async def export_report(
 
         logo_path = "icononly_transparent_nobuffer.png" 
         if os.path.exists(logo_path):
-            # Anchor at B2, scale 0.05 (5% - adjusted based on previous feedback)
-            worksheet.insert_image('B2', logo_path, {'x_scale': 0.05, 'y_scale': 0.05})
+            worksheet.insert_image('B2', logo_path, {'x_scale': 0.04, 'y_scale': 0.04, 'x_offset': 50, 'y_offset': 5})
             
         worksheet.set_row(1, 45) 
         worksheet.set_row(2, 25) 
@@ -466,14 +481,11 @@ async def export_report(
         
         worksheet.write('B5', "Report By:", fmt_meta_label)
         worksheet.write('C5', "Operartis Analytics", fmt_meta_value)
-        
         worksheet.write('B6', "Report Date:", fmt_meta_label)
         worksheet.write('C6', datetime.now().strftime("%Y-%m-%d %H:%M"), fmt_meta_value)
-        
         worksheet.write('B7', "Model Used:", fmt_meta_label)
         worksheet.write('C7', MODEL_DISPLAY_NAMES.get(model_type, model_type), fmt_meta_value)
         
-        # Dynamic Column Header
         headers = ["Period", "Actual History", f"Validation (Test {test_horizon} horizon)", "Accuracy Delta", "Future Forecast"]
         for col, h in enumerate(headers):
             worksheet.write(9, col+1, h, fmt_table_header) 
