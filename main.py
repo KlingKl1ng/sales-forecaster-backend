@@ -27,7 +27,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"] # Fix for filename visibility
+    expose_headers=["Content-Disposition"]
 )
 
 # --- HEALTH CHECK ---
@@ -171,6 +171,7 @@ async def validate_models(
         models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
 
         if validation_method == "simple":
+            # First Slice Logic
             validation_slice = full_series.iloc[:train_horizon + test_horizon]
             train_s = validation_slice.iloc[:train_horizon]
             test_s = validation_slice.iloc[train_horizon:]
@@ -192,12 +193,15 @@ async def validate_models(
                     mse, fc = fit_and_score(m, train_s, test_s, test_horizon)
                     if mse is not None: 
                         models_mse_list[m].append(mse)
+                        # LOGIC FOR CHART/STITCHING
                         if test_horizon == 1:
+                             # Special case: concat all
                              if models_stitched_forecasts[m].empty:
                                  models_stitched_forecasts[m] = fc
                              else:
                                  models_stitched_forecasts[m] = pd.concat([models_stitched_forecasts[m], fc])
                         else:
+                             # Standard case: Only keep the FIRST fold (matching simple logic)
                              if models_stitched_forecasts[m].empty:
                                  models_stitched_forecasts[m] = fc
 
@@ -386,23 +390,31 @@ async def export_report(
         logger.info(f"Generating Report for {model_type}")
         contents = await file.read()
         full_series = load_and_prep_data(contents)
+        clean_filename = os.path.splitext(file.filename)[0]
         
-        # 1. RUN VALIDATION
+        # --- 1. RUN VALIDATION (Conditional Logic) ---
         val_forecast = None
         if len(full_series) <= test_horizon:
              raise HTTPException(status_code=400, detail="Not enough data for validation export")
         
         if validation_method == "simple":
+             # Logic: First Slice (Train 1..N -> Forecast N+1)
              validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
              train_subset = validation_scope_df.iloc[:train_horizon]
              val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
         
         elif validation_method == "walk_forward":
+             # Logic matches the chart: 
+             # If test_horizon == 1: Stitch all folds
+             # If test_horizon > 1: Only the first fold
+             
              if test_horizon > 1:
+                 # Behave like simple split (First Fold)
                  validation_scope_df = full_series.iloc[:train_horizon + test_horizon]
                  train_subset = validation_scope_df.iloc[:train_horizon]
                  val_forecast = _run_model_logic(train_subset, model_type, test_horizon)
              else:
+                 # Stitch everything
                  val_forecast_series = pd.Series(dtype='float64')
                  start_index = train_horizon
                  end_index = len(full_series) - test_horizon
@@ -416,11 +428,11 @@ async def export_report(
 
         if val_forecast is None: raise HTTPException(status_code=500, detail="Validation model failed")
 
-        # 2. RUN FUTURE FORECAST
+        # --- 2. RUN FUTURE FORECAST ---
         future_forecast = _run_model_logic(full_series, model_type, forecast_steps)
         if future_forecast is None: raise HTTPException(status_code=500, detail="Forecast model failed")
 
-        # 3. BUILD MASTER DATAFRAME
+        # --- 3. BUILD MASTER DATAFRAME ---
         all_dates = sorted(list(set(list(full_series.index) + list(future_forecast.index))))
         master_df = pd.DataFrame(index=all_dates)
         master_df.index.name = "Period"
@@ -434,11 +446,12 @@ async def export_report(
             axis=1
         )
         
-        # 4. EXCEL GENERATION
+        # --- 4. EXCEL GENERATION ---
         output = io.BytesIO()
         workbook = xlsxwriter.Workbook(output, {'in_memory': True})
         worksheet = workbook.add_worksheet("Operartis Report")
         
+        # Formats
         fmt_header_main = workbook.add_format({'bold': True, 'font_size': 20, 'font_color': '#b45309', 'align': 'left', 'valign': 'vcenter'})
         fmt_header_sub = workbook.add_format({'italic': True, 'font_color': '#b45309', 'align': 'left', 'valign': 'top'})
         fmt_meta_label = workbook.add_format({'bold': True, 'font_size': 9, 'font_color': '#475569', 'bg_color': '#f1f5f9', 'border': 1, 'align': 'left'})
@@ -461,6 +474,7 @@ async def export_report(
 
         logo_path = "icononly_transparent_nobuffer.png" 
         if os.path.exists(logo_path):
+            # Anchor at B2, scale 0.05 (5% - adjusted based on previous feedback)
             worksheet.insert_image('B2', logo_path, {'x_scale': 0.05, 'y_scale': 0.05, 'x_offset': 50})
             
         worksheet.set_row(1, 45) 
@@ -470,25 +484,24 @@ async def export_report(
         worksheet.merge_range('C3:F3', "Optimizing Today, Growing Tomorrow.", fmt_header_sub)
         
         # Metadata Block
-        clean_filename = os.path.splitext(file.filename)[0]
         worksheet.write('B5', "Report By:", fmt_meta_label)
         worksheet.write('C5', "Operartis Analytics", fmt_meta_value)
         
         worksheet.write('B6', "Report Date:", fmt_meta_label)
         worksheet.write('C6', datetime.now().strftime("%Y-%m-%d %H:%M"), fmt_meta_value)
-
+        
         worksheet.write('B7', "Report For:", fmt_meta_label)
         worksheet.write('C7', clean_filename, fmt_meta_value)
-        
+
         worksheet.write('B8', "Model Used:", fmt_meta_label)
         worksheet.write('C8', MODEL_DISPLAY_NAMES.get(model_type, model_type), fmt_meta_value)
-
+        
         # LEGEND (Added to E5-E7)
         worksheet.write('E5', "Legend:", fmt_meta_label)
         worksheet.write('E6', "Green: Over-forecast (Positive)", fmt_meta_value)
         worksheet.write('E7', "Red: Under-forecast (Negative)", fmt_meta_value)
-        
-        # Dynamic Header
+
+        # Dynamic Column Header
         headers = ["Period", "Actual History", f"Validation (Test {test_horizon} horizon)", "Accuracy Delta", "Future Forecast"]
         for col, h in enumerate(headers):
             worksheet.write(9, col+1, h, fmt_table_header) 
@@ -516,8 +529,9 @@ async def export_report(
         workbook.close()
         output.seek(0)
         
-        # --- CORRECTED FILENAME FORMAT ---
-        filename = f"Operartis_Forecast_{clean_filename}_{model_type.upper()}.xlsx"
+        # Updated filename with timestamp
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"Operartis_Forecast_{clean_filename}_{timestamp_str}.xlsx"
         
         return StreamingResponse(
             output, 
