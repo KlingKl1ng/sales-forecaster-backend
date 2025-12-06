@@ -1,12 +1,16 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Security, Depends, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 import io
 import logging
 import xlsxwriter 
 import os
+import math 
 from datetime import datetime
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from prophet import Prophet
@@ -29,6 +33,66 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"]
 )
+
+# ---------------------------------------------------------
+# NEW: SECURITY CONFIGURATION
+# ---------------------------------------------------------
+API_KEY_NAME = "X-API-Key"
+API_KEY_HEADER = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+# ADMIN CONFIG: Add your clients here
+AUTHORIZED_USERS = {
+    "Admin (You)": "sk_admin_master_key_888",
+    "Friend 1": "sk_friend_001_abc", 
+    "Friend 2": "sk_friend_002_xyz",
+    "Client A": "sk_client_a_prod_777"
+}
+
+# Rate Limiting
+RATE_LIMIT_WINDOW = 60 
+RATE_LIMIT_MAX_REQUESTS = 20
+request_history = {} 
+
+async def get_api_key(api_key_header: str = Security(API_KEY_HEADER)):
+    if api_key_header in AUTHORIZED_USERS.values():
+        return api_key_header
+    raise HTTPException(status_code=403, detail="Access Denied: Invalid or inactive API Key.")
+
+async def check_rate_limit(api_key: str = Security(get_api_key)):
+    current_time = time.time()
+    if api_key not in request_history:
+        request_history[api_key] = []
+    request_history[api_key] = [t for t in request_history[api_key] if current_time - t < RATE_LIMIT_WINDOW]
+    if len(request_history[api_key]) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+    request_history[api_key].append(current_time)
+    return api_key
+
+# NEW: Pydantic Models for API
+class DataPoint(BaseModel):
+    date: str = Field(..., description="Date in YYYY-MM-DD format")
+    value: float = Field(..., description="The observed value")
+
+class ForecastRequest(BaseModel):
+    data: List[DataPoint]
+    model_type: str = Field("ses")
+    forecast_steps: int = Field(6, ge=1, le=60)
+
+class ForecastResponse(BaseModel):
+    model_name: str
+    forecast_mse: Optional[float]
+    history: List[Dict[str, Any]]
+    forecast: List[Dict[str, Any]]
+    message: str
+
+# Helper to fix "Out of range float values" error in JSON
+def clean_float(val):
+    if val is None: return None
+    try:
+        f_val = float(val)
+        if math.isnan(f_val) or math.isinf(f_val): return None
+        return f_val
+    except: return None
 
 # --- HEALTH CHECK ---
 @app.get("/")
@@ -79,7 +143,7 @@ MODEL_DISPLAY_NAMES = {
     "prophet": "Prophet (Complex)"
 }
 
-# --- NEW: HELPER FOR EXPORT ---
+# --- HELPER FOR EXPORT (Original) ---
 def _run_model_logic(series, model_code, steps):
     try:
         if model_code == 'ses':
@@ -106,7 +170,7 @@ def _run_model_logic(series, model_code, steps):
         return None
     return None
 
-# --- VALIDATION ENDPOINT ---
+# --- VALIDATION ENDPOINT (Original Logic) ---
 @app.post("/validate")
 async def validate_models(
     file: UploadFile = File(...),
@@ -128,7 +192,6 @@ async def validate_models(
         if total_len < train_horizon + test_horizon:
              raise HTTPException(status_code=400, detail=f"Insufficient data. Length ({total_len}) must be >= Train ({train_horizon}) + Test ({test_horizon})")
 
-        # --- DEFINING MODEL LOGIC (Local Scope for Validation) ---
         def fit_and_score(model_code, train_data, test_data, horizon):
             try:
                 mse = float('inf')
@@ -171,7 +234,6 @@ async def validate_models(
         models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
 
         if validation_method == "simple":
-            # First Slice Logic
             validation_slice = full_series.iloc[:train_horizon + test_horizon]
             train_s = validation_slice.iloc[:train_horizon]
             test_s = validation_slice.iloc[train_horizon:]
@@ -193,15 +255,12 @@ async def validate_models(
                     mse, fc = fit_and_score(m, train_s, test_s, test_horizon)
                     if mse is not None: 
                         models_mse_list[m].append(mse)
-                        # LOGIC FOR CHART/STITCHING
                         if test_horizon == 1:
-                             # Special case: concat all
                              if models_stitched_forecasts[m].empty:
                                  models_stitched_forecasts[m] = fc
                              else:
                                  models_stitched_forecasts[m] = pd.concat([models_stitched_forecasts[m], fc])
                         else:
-                             # Standard case: Only keep the FIRST fold (matching simple logic)
                              if models_stitched_forecasts[m].empty:
                                  models_stitched_forecasts[m] = fc
 
@@ -287,7 +346,7 @@ async def validate_models(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- PREDICTION ENDPOINT ---
+# --- PREDICTION ENDPOINT (Original Logic) ---
 @app.post("/predict")
 async def predict_sales(
     file: UploadFile = File(...),
@@ -376,7 +435,117 @@ async def predict_sales(
         logger.error(f"Global Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: EXPORT ENDPOINT ---
+# --- NEW: API ENDPOINT (Using copied logic to preserve original structure) ---
+@app.post("/api/v1/forecast", response_model=ForecastResponse)
+async def api_forecast(
+    request: ForecastRequest, 
+    api_key: str = Security(check_rate_limit)
+):
+    try:
+        # 1. Convert JSON to Pandas Series
+        data_dicts = [item.dict() for item in request.data]
+        df = pd.DataFrame(data_dicts)
+        
+        try:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date').sort_index()
+            df['value'] = pd.to_numeric(df['value'])
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid data format.")
+            
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Data payload is empty.")
+            
+        # Ensure Frequency
+        if df.index.freq is None:
+            df.index.freq = pd.infer_freq(df.index)
+        if df.index.freq is None:
+            df = df.asfreq('MS').fillna(0)
+        
+        training_series = df['value']
+        model_type = request.model_type
+        forecast_steps = request.forecast_steps
+        
+        # 2. RUN MODEL LOGIC (Copied from /predict to ensure isolation)
+        models_run = {} 
+
+        def run_ses():
+            model = ExponentialSmoothing(training_series, trend=None, seasonal=None)
+            fit = model.fit(optimized=True)
+            mse, _, _ = metrics(training_series - fit.fittedvalues)
+            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+        def run_des():
+            model = ExponentialSmoothing(training_series, trend="add", seasonal=None)
+            fit = model.fit(optimized=True)
+            mse, _, _ = metrics(training_series - fit.fittedvalues)
+            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+        def run_tes():
+            if len(training_series) < 24: raise ValueError("Insufficient data for TES")
+            model = ExponentialSmoothing(training_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS')
+            fit = model.fit(optimized=True)
+            mse, _, _ = metrics(training_series - fit.fittedvalues)
+            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+        def run_prophet():
+            df_prophet = pd.DataFrame({'ds': training_series.index, 'y': training_series.values})
+            m = Prophet()
+            m.fit(df_prophet)
+            future = m.make_future_dataframe(periods=forecast_steps, freq='MS')
+            forecast = m.predict(future)
+            fitted_vals = forecast.set_index('ds').loc[training_series.index]['yhat']
+            mse, _, _ = metrics(training_series - fitted_vals)
+            return {'mse': mse, 'fit': fitted_vals, 'forecast': pd.Series(forecast['yhat'].iloc[len(training_series):].values, index=future['ds'].iloc[len(training_series):])}
+
+        available_models = {"ses": run_ses, "des": run_des, "tes": run_tes, "prophet": run_prophet}
+
+        if model_type in available_models:
+            try:
+                res = available_models[model_type]()
+                if res: models_run[model_type] = res
+            except Exception as e: raise HTTPException(status_code=400, detail=f"Model {model_type} failed: {str(e)}")
+        else: raise HTTPException(status_code=400, detail=f"Unknown model type: {model_type}")
+
+        if not models_run: raise HTTPException(status_code=500, detail="Forecasting failed.")
+
+        best_model_code = list(models_run.keys())[0] 
+        best_result = models_run[best_model_code]
+        best_model_display_name = MODEL_DISPLAY_NAMES.get(best_model_code, best_model_code)
+        
+        # 3. BUILD RESPONSE (With clean_float for safety)
+        history_data = []
+        best_fit_values = best_result['fit']
+        for date_idx, actual_val in training_series.items():
+            fitted_val = None
+            if date_idx in best_fit_values.index:
+                val = best_fit_values.loc[date_idx]
+                if not np.isnan(val): fitted_val = clean_float(val)
+            history_data.append({
+                "name": date_idx.strftime('%b %Y'), 
+                "actual_train": clean_float(actual_val),
+                "fitted": fitted_val
+            })
+
+        forecast_data = []
+        best_forecast_values = best_result['forecast']
+        for date_idx, val in best_forecast_values.items():
+            clean_val = clean_float(val) if not np.isnan(val) else 0
+            forecast_data.append({
+                "name": date_idx.strftime('%b %Y') + " (fc)", 
+                "forecast": clean_val
+            })
+
+        return {
+            "history": history_data,
+            "forecast": forecast_data,
+            "model_name": best_model_display_name,
+            "forecast_mse": clean_float(best_result['mse']),
+            "message": "Optimization Complete"
+        }
+
+    except Exception as e:
+        logger.error(f"API Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- EXPORT ENDPOINT (Original) ---
 @app.post("/export")
 async def export_report(
     file: UploadFile = File(...),
@@ -525,6 +694,7 @@ async def export_report(
         footer_row = row + 2
         worksheet.write(footer_row, 1, f"© {datetime.now().year} Operartis Analytics. All rights reserved.", fmt_footer)
 
+        #Worksheet Protection Layer
         worksheet.protect('Operartis020561', {'select_locked_cells': True, 'select_unlocked_cells': True})
         workbook.close()
         output.seek(0)
