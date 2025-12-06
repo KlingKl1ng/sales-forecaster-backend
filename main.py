@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("operartis_forecaster")
 
-app = FastAPI(title="Operartis Sales Forecaster")
+app = FastAPI(title="Operartis Sales Forecaster", version="3.0")
 
 # --- CORS ---
 app.add_middleware(
@@ -34,9 +34,7 @@ app.add_middleware(
     expose_headers=["Content-Disposition"]
 )
 
-# ---------------------------------------------------------
-# NEW: SECURITY CONFIGURATION
-# ---------------------------------------------------------
+# --- SECURITY CONFIGURATION ---
 API_KEY_NAME = "X-API-Key"
 API_KEY_HEADER = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
@@ -68,22 +66,37 @@ async def check_rate_limit(api_key: str = Security(get_api_key)):
     request_history[api_key].append(current_time)
     return api_key
 
-# NEW: Pydantic Models for API
+# --- PYDANTIC MODELS FOR API ---
 class DataPoint(BaseModel):
     date: str = Field(..., description="Date in YYYY-MM-DD format")
     value: float = Field(..., description="The observed value")
+
+class ValidationReport(BaseModel):
+    winner_model: str
+    best_mse: Optional[float]
+    history: List[Dict[str, Any]]
+    forecast: List[Dict[str, Any]]
+
+class ForecastReport(BaseModel):
+    model_name: str
+    forecast_mse: Optional[float]
+    history: List[Dict[str, Any]]
+    forecast: List[Dict[str, Any]]
 
 class ForecastRequest(BaseModel):
     data: List[DataPoint]
     model_type: str = Field("ses")
     forecast_steps: int = Field(6, ge=1, le=60)
+    # New fields for optional validation
+    run_validation: bool = Field(False)
+    validation_method: Optional[str] = Field("simple")
+    train_horizon: Optional[int] = Field(None)
+    test_horizon: Optional[int] = Field(None)
 
-class ForecastResponse(BaseModel):
-    model_name: str
-    forecast_mse: Optional[float]
-    history: List[Dict[str, Any]]
-    forecast: List[Dict[str, Any]]
+class FullApiResponse(BaseModel):
     message: str
+    validation_report: Optional[ValidationReport]
+    forecast_report: ForecastReport
 
 # Helper to fix "Out of range float values" error in JSON
 def clean_float(val):
@@ -234,6 +247,7 @@ async def validate_models(
         models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
 
         if validation_method == "simple":
+            # First Slice Logic
             validation_slice = full_series.iloc[:train_horizon + test_horizon]
             train_s = validation_slice.iloc[:train_horizon]
             test_s = validation_slice.iloc[train_horizon:]
@@ -435,8 +449,118 @@ async def predict_sales(
         logger.error(f"Global Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: API ENDPOINT (Using copied logic to preserve original structure) ---
-@app.post("/api/v1/forecast", response_model=ForecastResponse)
+# --- NEW: UNIFIED API ENDPOINT (Validation + Forecast) ---
+def _run_api_validation_logic(full_series, method, train_h, test_h):
+    # Independent validation logic specifically for API to avoid tangling with file uploads
+    if len(full_series) < train_h + test_h:
+        return None # Insufficient data
+
+    models_to_test = ["ses", "des", "tes", "prophet"]
+    models_mse_list = {m: [] for m in models_to_test}
+    models_stitched_forecasts = {m: pd.Series(dtype='float64') for m in models_to_test}
+
+    def fit_and_score(model_code, train_data, test_data, horizon):
+        try:
+            mse = None
+            fc_series = None
+            if model_code == 'ses':
+                m = ExponentialSmoothing(train_data, trend=None, seasonal=None).fit(optimized=True)
+                fc = m.forecast(horizon)
+                mse, _, _ = metrics(test_data - fc)
+                fc_series = fc
+            elif model_code == 'des':
+                m = ExponentialSmoothing(train_data, trend="add", seasonal=None).fit(optimized=True)
+                fc = m.forecast(horizon)
+                mse, _, _ = metrics(test_data - fc)
+                fc_series = fc
+            elif model_code == 'tes':
+                if len(train_data) >= 24:
+                    m = ExponentialSmoothing(train_data, seasonal_periods=12, trend='add', seasonal='add', freq='MS').fit(optimized=True)
+                    fc = m.forecast(horizon)
+                    mse, _, _ = metrics(test_data - fc)
+                    fc_series = fc
+            elif model_code == 'prophet':
+                df = pd.DataFrame({'ds': train_data.index, 'y': train_data.values})
+                m = Prophet()
+                m.fit(df)
+                fut = m.make_future_dataframe(periods=horizon, freq='MS')
+                pred = m.predict(fut)
+                fc_vals = pred.iloc[-horizon:]['yhat'].values
+                fc_series = pd.Series(fc_vals, index=test_data.index)
+                mse, _, _ = metrics(test_data - fc_series)
+            return mse, fc_series
+        except: return None, None
+
+    if method == "simple":
+        train_s = full_series.iloc[:train_h]
+        test_s = full_series.iloc[train_h : train_h + test_h]
+        for m in models_to_test:
+            mse, fc = fit_and_score(m, train_s, test_s, test_h)
+            if mse is not None:
+                models_mse_list[m].append(mse)
+                models_stitched_forecasts[m] = fc
+
+    elif method == "walk_forward":
+        start = train_h
+        end = len(full_series) - test_h
+        step = test_h
+        for i in range(start, end + 1, step):
+            train_s = full_series.iloc[:i]
+            test_s = full_series.iloc[i : i + test_h]
+            for m in models_to_test:
+                mse, fc = fit_and_score(m, train_s, test_s, test_h)
+                if mse is not None:
+                    models_mse_list[m].append(mse)
+                    if test_h == 1:
+                        if models_stitched_forecasts[m].empty: models_stitched_forecasts[m] = fc
+                        else: models_stitched_forecasts[m] = pd.concat([models_stitched_forecasts[m], fc])
+                    else:
+                         if models_stitched_forecasts[m].empty: models_stitched_forecasts[m] = fc
+
+    final_scores = {}
+    for m, errs in models_mse_list.items():
+        # Clean errors
+        valid_errs = [e for e in errs if clean_float(e) is not None]
+        if valid_errs: final_scores[m] = np.mean(valid_errs)
+
+    if not final_scores: return None
+
+    best_model_code = min(final_scores, key=final_scores.get)
+    best_mse = final_scores[best_model_code]
+    winner_fc = models_stitched_forecasts[best_model_code]
+    
+    # Build Validation Report Data
+    fc_start = winner_fc.index[0]
+    viz_hist = full_series[full_series.index < fc_start]
+    viz_actuals = full_series[full_series.index.isin(winner_fc.index)]
+    
+    history_data = []
+    for date_idx, val in viz_hist.items():
+        history_data.append({
+            "name": date_idx.strftime('%b %Y'), 
+            "actual_train": clean_float(val), 
+            "fitted": None # Simplified for API report to reduce processing time
+        })
+        
+    forecast_data = []
+    for date_idx, val in winner_fc.items():
+        act = None
+        if date_idx in viz_actuals.index: act = clean_float(viz_actuals.loc[date_idx])
+        forecast_data.append({
+            "name": date_idx.strftime('%b %Y') + " (val)",
+            "forecast": clean_float(val),
+            "actual_test": act
+        })
+
+    return {
+        "winner_model": MODEL_DISPLAY_NAMES.get(best_model_code, best_model_code),
+        "best_mse": clean_float(best_mse),
+        "history": history_data,
+        "forecast": forecast_data
+    }
+
+
+@app.post("/api/v1/forecast", response_model=FullApiResponse)
 async def api_forecast(
     request: ForecastRequest, 
     api_key: str = Security(check_rate_limit)
@@ -445,7 +569,6 @@ async def api_forecast(
         # 1. Convert JSON to Pandas Series
         data_dicts = [item.dict() for item in request.data]
         df = pd.DataFrame(data_dicts)
-        
         try:
             df['date'] = pd.to_datetime(df['date'])
             df = df.set_index('date').sort_index()
@@ -453,67 +576,73 @@ async def api_forecast(
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid data format.")
             
-        if df.empty:
-            raise HTTPException(status_code=400, detail="Data payload is empty.")
-            
-        # Ensure Frequency
+        if df.empty: raise HTTPException(status_code=400, detail="Data payload is empty.")
         if df.index.freq is None:
             df.index.freq = pd.infer_freq(df.index)
         if df.index.freq is None:
             df = df.asfreq('MS').fillna(0)
         
-        training_series = df['value']
-        model_type = request.model_type
-        forecast_steps = request.forecast_steps
+        full_series = df['value']
         
-        # 2. RUN MODEL LOGIC (Copied from /predict to ensure isolation)
+        # 2. Run Validation (Optional)
+        val_report = None
+        if request.run_validation:
+            if not request.train_horizon or not request.test_horizon:
+                 raise HTTPException(status_code=400, detail="train_horizon and test_horizon are required for validation.")
+            
+            val_report = _run_api_validation_logic(
+                full_series, 
+                request.validation_method, 
+                request.train_horizon, 
+                request.test_horizon
+            )
+            # If validation returns None (e.g. insufficient data), we can either error out or return null.
+            # Here we just leave it as None (null in JSON)
+        
+        # 3. Run Future Forecast (Always)
+        # Use copied logic from /predict for isolation
         models_run = {} 
-
         def run_ses():
-            model = ExponentialSmoothing(training_series, trend=None, seasonal=None)
+            model = ExponentialSmoothing(full_series, trend=None, seasonal=None)
             fit = model.fit(optimized=True)
-            mse, _, _ = metrics(training_series - fit.fittedvalues)
-            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+            mse, _, _ = metrics(full_series - fit.fittedvalues)
+            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(request.forecast_steps)}
         def run_des():
-            model = ExponentialSmoothing(training_series, trend="add", seasonal=None)
+            model = ExponentialSmoothing(full_series, trend="add", seasonal=None)
             fit = model.fit(optimized=True)
-            mse, _, _ = metrics(training_series - fit.fittedvalues)
-            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+            mse, _, _ = metrics(full_series - fit.fittedvalues)
+            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(request.forecast_steps)}
         def run_tes():
-            if len(training_series) < 24: raise ValueError("Insufficient data for TES")
-            model = ExponentialSmoothing(training_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS')
+            if len(full_series) < 24: raise ValueError("Insufficient data for TES")
+            model = ExponentialSmoothing(full_series, seasonal_periods=12, trend='add', seasonal='add', freq='MS')
             fit = model.fit(optimized=True)
-            mse, _, _ = metrics(training_series - fit.fittedvalues)
-            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(forecast_steps)}
+            mse, _, _ = metrics(full_series - fit.fittedvalues)
+            return {'mse': mse, 'fit': fit.fittedvalues, 'forecast': fit.forecast(request.forecast_steps)}
         def run_prophet():
-            df_prophet = pd.DataFrame({'ds': training_series.index, 'y': training_series.values})
+            df_p = pd.DataFrame({'ds': full_series.index, 'y': full_series.values})
             m = Prophet()
-            m.fit(df_prophet)
-            future = m.make_future_dataframe(periods=forecast_steps, freq='MS')
-            forecast = m.predict(future)
-            fitted_vals = forecast.set_index('ds').loc[training_series.index]['yhat']
-            mse, _, _ = metrics(training_series - fitted_vals)
-            return {'mse': mse, 'fit': fitted_vals, 'forecast': pd.Series(forecast['yhat'].iloc[len(training_series):].values, index=future['ds'].iloc[len(training_series):])}
+            m.fit(df_p)
+            future = m.make_future_dataframe(periods=request.forecast_steps, freq='MS')
+            fc_df = m.predict(future)
+            fitted_vals = fc_df.set_index('ds').loc[full_series.index]['yhat']
+            mse, _, _ = metrics(full_series - fitted_vals)
+            return {'mse': mse, 'fit': fitted_vals, 'forecast': pd.Series(fc_df['yhat'].iloc[len(full_series):].values, index=future['ds'].iloc[len(full_series):])}
 
         available_models = {"ses": run_ses, "des": run_des, "tes": run_tes, "prophet": run_prophet}
-
-        if model_type in available_models:
-            try:
-                res = available_models[model_type]()
-                if res: models_run[model_type] = res
-            except Exception as e: raise HTTPException(status_code=400, detail=f"Model {model_type} failed: {str(e)}")
-        else: raise HTTPException(status_code=400, detail=f"Unknown model type: {model_type}")
-
-        if not models_run: raise HTTPException(status_code=500, detail="Forecasting failed.")
-
-        best_model_code = list(models_run.keys())[0] 
-        best_result = models_run[best_model_code]
-        best_model_display_name = MODEL_DISPLAY_NAMES.get(best_model_code, best_model_code)
         
-        # 3. BUILD RESPONSE (With clean_float for safety)
+        if request.model_type in available_models:
+            try:
+                res = available_models[request.model_type]()
+                models_run[request.model_type] = res
+            except Exception as e: raise HTTPException(status_code=400, detail=f"Model failed: {str(e)}")
+        else: raise HTTPException(status_code=400, detail="Unknown model type")
+
+        best_model_code = list(models_run.keys())[0]
+        best_result = models_run[best_model_code]
+        
         history_data = []
         best_fit_values = best_result['fit']
-        for date_idx, actual_val in training_series.items():
+        for date_idx, actual_val in full_series.items():
             fitted_val = None
             if date_idx in best_fit_values.index:
                 val = best_fit_values.loc[date_idx]
@@ -533,12 +662,17 @@ async def api_forecast(
                 "forecast": clean_val
             })
 
-        return {
-            "history": history_data,
-            "forecast": forecast_data,
-            "model_name": best_model_display_name,
+        forecast_report = {
+            "model_name": MODEL_DISPLAY_NAMES.get(request.model_type, request.model_type),
             "forecast_mse": clean_float(best_result['mse']),
-            "message": "Optimization Complete"
+            "history": history_data,
+            "forecast": forecast_data
+        }
+
+        return {
+            "message": "Analysis Complete",
+            "validation_report": val_report,
+            "forecast_report": forecast_report
         }
 
     except Exception as e:
